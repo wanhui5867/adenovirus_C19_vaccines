@@ -1,0 +1,812 @@
+---
+title: "hashtag_scRNA"
+author: "hui.wan"
+date: "12/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = F, message = F)
+knitr::opts_knit$set(root.dir = '~/OneDrive - KI.SE/Mac/Project/cowork/20211210_scRNA_hybridvaccine/')
+```
+
+```{r load pkgs}
+library(Seurat)
+library(patchwork)
+library(tidyverse)
+library(cowplot)
+library(Matrix)
+library(DoubletFinder)
+library(scRepertoire)
+library(harmony)
+library(clustree)
+library(scPred)
+library(RColorBrewer)
+library(ggpubr)
+library(eoffice)
+
+```
+
+# Description
+
+*Aim*:
+This experiment seeks to understand the hybrid immunity induced by either Cansino vs. AstraZeneca vaccines. 
+
+*Expermient*:
+We have only two reactions. Each reaction has five pools, and each pool has three samples. Samples include patients vaccinated with Cansino or AstraZeneca, with previous or no infection. Each reaction have data for VDJ, GEX, and HashTag.
+
+*Analysis*:
+0. Alignment: CellRanger multi (done)
+1. Merge data 
+2. QC: filter MT
+3. Dimensionality reduction, BatchEffector, Clustering
+4. Annotation: 
+5. scRNAseq: DEGs among vaccine, and different cell types
+6. scBCRseq: VDJ recombination. isotype
+
+## set variables
+```{r gloable vars}
+order_sample = c( "AZ", "AZ-hb", 'Cso', 'Cso-hb', "Inf")
+color_sample = structure( brewer.pal(6, 'Paired')[c(1,2,3,4,5)],
+                          names = c('Cso', 'Cso-hb', "AZ", "AZ-hb", "Inf"))
+
+color_tf = structure(brewer.pal(9, 'Set1')[c(1,9)], names = c('True', 'False'))
+
+outfile = 'plots/plot_20230401.pptx'
+```
+
+
+## Read data
+
+```{r read data1}
+
+muestra1 <- Read10X(data.dir = "muestra1/outs/count/filtered_feature_bc_matrix/" )
+m1.umis <- muestra1$`Gene Expression`
+m1.htos <- muestra1$`Antibody Capture`
+
+#Select cell barcodes detected by both RNA and HTO In the example datasets we have already
+# Subset RNA and HTO counts by joint cell barcodes
+# It seems Cellragner6 multi already joint the common  
+m1.bcs <- intersect(colnames(m1.umis), colnames(m1.htos))
+m1.umis <- m1.umis[, m1.bcs]
+m1.htos <- as.matrix(m1.htos[, m1.bcs])
+
+# Confirm that the HTO have the correct names
+rownames(m1.htos) = c('Cso', 'Cso-hb', "AZ", "AZ-hb", "Inf")
+
+
+# Setup Seurat object
+m1.hashtag <- CreateSeuratObject(counts = m1.umis, project = "muestra1" , min.cells = 3) 
+#m1.hashtag <- CreateSeuratObject(counts = m1.umis, project = "muestra1")  # 36601 gene ; 6684 cells
+m1.hashtag[["HTO"]] <- CreateAssayObject(counts = m1.htos)
+
+
+
+```
+
+
+
+```{r read data2}
+
+muestra2 <- Read10X(data.dir = "muestra2/outs/count/filtered_feature_bc_matrix/")
+m2.umis <- muestra2$`Gene Expression`
+m2.htos <- muestra2$`Antibody Capture`
+
+#Select cell barcodes detected by both RNA and HTO In the example datasets we have already
+# Subset RNA and HTO counts by joint cell barcodes
+# It seems Cellragner6 multi already joint the common  
+m2.bcs <- intersect(colnames(m2.umis), colnames(m2.htos))
+m2.umis <- m2.umis[, m2.bcs]
+m2.htos <- as.matrix(m2.htos[, m2.bcs])
+
+# Confirm that the HTO have the correct names
+rownames(m2.htos) = c('Cso', 'Cso-hb', "AZ", "AZ-hb", "Inf")
+
+# Setup Seurat object
+m2.hashtag <- CreateSeuratObject(counts = m2.umis, project = "muestra2",  min.cells = 3 ) 
+#m2.hashtag <- CreateSeuratObject(counts = m2.umis, project = "muestra1") # 36601 gene ; 6684 cells
+
+m2.hashtag[["HTO"]] <- CreateAssayObject(counts = m2.htos)
+
+```
+
+
+
+
+## Merge Data
+```{r demultiplex HTO}
+
+# merge
+pbmc.hashtag <- merge(m1.hashtag, m2.hashtag,
+                 add.cell.ids = c('muestra1', 'muestra2'))
+
+# Normalize RNA data with log normalization
+pbmc.hashtag <- NormalizeData(pbmc.hashtag)
+
+# # Find and scale variable features
+ pbmc.hashtag <- FindVariableFeatures(pbmc.hashtag, selection.method = "mean.var.plot")
+ pbmc.hashtag <- ScaleData(pbmc.hashtag, features = VariableFeatures(pbmc.hashtag))
+ 
+
+# Normalize HTO data, here we use centered log-ratio (CLR) transformation
+pbmc.hashtag <- NormalizeData(pbmc.hashtag, assay = "HTO", normalization.method = "CLR")
+
+#demultiplex cells based on HTO enrichment
+pbmc.hashtag <- HTODemux(pbmc.hashtag, assay = "HTO", positive.quantile = 0.99)
+```
+
+
+```{r merge BCR}
+m1.bcrs <- read.csv('muestra1/outs/vdj_b/filtered_contig_annotations.csv')
+m2.bcrs <- read.csv('muestra2/outs/vdj_b/filtered_contig_annotations.csv')
+
+combined.bcrs <- combineBCR(list(m1.bcrs, m2.bcrs), samples = c('muestra1', 'muestra2'), removeNA = F, removeMulti = T)
+pbmc.hashtag <- combineExpression(combined.bcrs, pbmc.hashtag, cloneCall = 'nt', proportion = T) # combine BCR after subset B cells and re-cluster
+
+```
+
+
+## QC 
+- calculate percetage of MT and ribosomal genes per cell, and add to the metadata
+```{r cal_MT_RP}
+# caculat MT genes' percent
+pbmc.hashtag <- PercentageFeatureSet(pbmc.hashtag, pattern =  "^MT-", col.name = "percent_mito")
+
+# caculate RP genes' percent
+pbmc.hashtag <- PercentageFeatureSet(pbmc.hashtag, pattern = "RP[SL]", col.name = "percent_ribo")
+
+# Percent hemoglobin genes - includes all genes staring with HB except HBP
+pbmc.hashtag<- PercentageFeatureSet(pbmc.hashtag, pattern = "^HB[^(P)]", col.name = 'percent_hb')
+
+#PLot some of the QC-features as violin Plots
+feats <- c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo", "percent_hb")
+VlnPlot(pbmc.hashtag, features = feats, pt.size = 0, ncol = 3, group.by = "orig.ident" ) + NoLegend()
+
+```
+
+- Detection-based filtering
+Filter low amount of reads as well as features that are present in at least a CUTOFF amnount of cells.
+Previous we already filter n_cell > 3 
+
+
+```{r filter}
+
+# raw stat
+dim(pbmc.hashtag)
+table(pbmc.hashtag$orig.ident)
+table(pbmc.hashtag$HTO_classification.global)
+pbmc.hashtag@meta.data %>% group_by(orig.ident, HTO_classification.global) %>%  summarise(n = n()) %>% spread(HTO_classification.global, n)
+
+# filter cells
+data.filt <- subset(pbmc.hashtag, subset = nFeature_RNA > 200 & nFeature_RNA < 4000 & percent_mito < 20  & percent_ribo > 5)
+
+dim(data.filt)
+table(data.filt$orig.ident)
+table(data.filt$HTO_classification)
+table(data.filt$HTO_classification.global)
+data.filt@meta.data %>% group_by(orig.ident, HTO_classification.global) %>%  summarise(n = n()) %>% spread(HTO_classification.global, n)
+
+
+```
+
+
+
+```{r filter Mito/Ribo genes , fig.height=16}
+#### the highly expressed genes in cell
+#Compute the relative expression of each gene per cell
+#Use sparse matrix operations, if your dataset is large, doing matrix devisions the regular way will take a very long time.
+par(mar=c(4,8,2,1))
+C <- data.filt@assays$RNA@counts
+C <-  Matrix::t( Matrix::t(C) / Matrix::colSums(C) ) * 100
+most_expressed <- order(apply(C,1,median),decreasing = T)[20:1]
+boxplot( as.matrix(t(C[most_expressed,])),cex=.1, las=1, xlab="% total count per cell",col=scales::hue_pal()(20)[20:1],horizontal=TRUE)
+
+
+### filter MT/RB genes-------
+dim(data.filt)
+
+# Filter MALAT1
+data.filt <- data.filt[ ! grepl("MALAT1", rownames(data.filt)), ]
+# Filter Mitocondrial
+data.filt <- data.filt[ ! grepl("^MT-", rownames(data.filt)), ]
+# Filter Ribosomal gene (optional if that is a problem on your data)
+data.filt <- data.filt[ ! grepl("^RP[SL]", rownames(data.filt)), ]
+# Filter Hemoglobin gene (optional if that is a problem on your data)
+data.filt <- data.filt[ ! grepl("^HB[^(P)]", rownames(data.filt)), ]
+
+dim(data.filt)
+
+
+```
+
+```{r subset singlet}
+# subset singlet
+pbmc.singlet <- subset(data.filt, subset = HTO_classification.global == "Singlet")
+table(pbmc.singlet$HTO_classification)
+pbmc.singlet@meta.data %>% group_by(orig.ident, HTO_classification) %>%  summarise(n = n()) %>% spread(HTO_classification, n)
+dim(pbmc.singlet)
+```
+
+
+- sex genes
+
+```{r sex TO RUN }
+
+genes.file = "ref/genes.table.csv"
+
+if (!file.exists(genes.file)){
+  suppressMessages(require(biomaRt))
+
+  # initialize connection to mart, may take some time if the sites are unresponsive.
+  mart <- useMart("ENSEMBL_MART_ENSEMBL", dataset="hsapiens_gene_ensembl")
+
+  # fetch chromosome info plus some other annotations
+  genes.table <- try(biomaRt::getBM(attributes = c("ensembl_gene_id",
+              "external_gene_name", "description","gene_biotype", "chromosome_name","start_position"),
+              mart = mart, useCache = F))
+  
+  if(!dir.exists("data/results")){dir.create("data/results")}
+  if(is.data.frame(genes.table)){write.csv(genes.table, file = genes.file)}
+  
+  if (!file.exists(genes.file)){
+  download.file("https://raw.githubusercontent.com/NBISweden/workshop-scRNAseq/master/labs/misc/genes.table.csv",destfile = "data/results/genes.table.csv")
+    genes.table = read.csv(genes.file)
+    }
+
+} else {
+  genes.table = read.csv(genes.file)
+}
+
+genes.table <- genes.table[genes.table$external_gene_name %in% rownames(pbmc.singlet),]
+
+
+chrY.gene = genes.table$external_gene_name[genes.table$chromosome_name == "Y"]
+
+pbmc.singlet$pct_chrY = colSums(pbmc.singlet@assays$RNA@counts[chrY.gene,]) / colSums(pbmc.singlet@assays$RNA@counts)
+
+FeatureScatter(pbmc.singlet, feature1 = "XIST", feature2 = "pct_chrY", group.by = 'HTO_classification')
+VlnPlot(pbmc.singlet, features = c("XIST", "pct_chrY"), group.by = 'HTO_classification') # so they are mixed individual in one group
+```
+
+
+- calculate cell-cycle scores
+
+```{r calculat cc score}
+
+# Before running CellCycleScoring, the data need to be normlized and logtransformed
+#pbmc.singlet = NormalizeData(pbmc.singlet)
+
+
+pbmc.singlet <- CellCycleScoring(object = pbmc.singlet, 
+                              g2m.features = cc.genes$g2m.genes,
+                              s.features = cc.genes$s.genes)
+VlnPlot(pbmc.singlet, features = c('S.Score', 'G2M.Score'), group.by = 'orig.ident', ncol = 4, pt.size = .1)
+
+```
+
+
+
+
+
+
+-filter doublets
+```{r DouletFinder?}
+# process predict doublets
+pbmc.singlet <- NormalizeData(pbmc.singlet,  normalization.method = "LogNormalize")
+pbmc.singlet = FindVariableFeatures(pbmc.singlet, verbose = F)
+pbmc.singlet = ScaleData(pbmc.singlet, vars.to.regress = c("nFeature_RNA", "percent_mito"), verbose = F)
+pbmc.singlet = RunPCA(pbmc.singlet, verbose = F, npcs = 20)
+pbmc.singlet = RunUMAP(pbmc.singlet, dims = 1:10, verbose = F)
+
+# 
+nExp <- round(ncol(pbmc.singlet)*0.039) # expect 3.9% doulets
+pbmc.singlet <- doubletFinder_v3(pbmc.singlet, pN=0.25, pK=0.09, nExp = nExp, PCs = 1:10)
+
+pbmc.singlet <- subset(pbmc.singlet, DF.classifications_0.25_0.09_329 == 'Singlet')
+dim(pbmc.singlet)
+
+```
+
+## Save data
+```{r save filter data}
+dir.create('results')
+saveRDS(data.filt, 'results/00_qc.rds')
+
+saveRDS(pbmc.singlet, 'results/01_qc_singlet.rds')
+write.csv(as.matrix(pbmc.singlet@assays$RNA@counts),'results/01_qc_singlet.geneExp.csv', col.names = T, row.names = T)
+```
+
+
+### Scaling and PCA 
+
+```{r}
+# Extract the singlets
+pbmc.singlet <- readRDS("results/01_qc_singlet.rds")
+
+# Nomarlize
+pbmc.singlet <- NormalizeData(pbmc.singlet,  normalization.method = "LogNormalize")
+
+# find variable features
+pbmc.singlet <- FindVariableFeatures(pbmc.singlet, selection.method = "mean.var.plot")
+#alldata <- FindVariableFeatures(alldata, selection.method = "vst", nfeatures = 2000, verbose = FALSE, assay = "RNA")
+
+# Scaling RNA data, we only scale the variable features here for efficiency
+pbmc.singlet <- ScaleData(pbmc.singlet,  vars.to.regress = c("percent_mito", "nFeature_RNA", 'S.Score', 'G2M.Score'))
+
+# Run PCA
+pbmc.singlet <- RunPCA(pbmc.singlet, npcs = 50, verbose = F)
+
+# 6. determine the 'dimensionality' of dataset by permute a subset of data, then select singificant PCs who has low p-value
+
+ElbowPlot(pbmc.singlet, reduction = "pca", ndims = 50) # 20-30 dims
+
+pbmc.singlet <- JackStraw(pbmc.singlet, num.replicate = 100, dims = 50)
+pbmc.singlet <- ScoreJackStraw(pbmc.singlet, dims = 1:50)
+JackStrawPlot(pbmc.singlet, dims = 1:30) # select20 
+
+n_dim = 20
+DimPlot(pbmc.singlet, group.by = "orig.ident", reduction = 'umap') +  ggtitle('umap')  # from the plot we can see there is no batch effector, so we can skip harmony
+```
+
+
+### batch effect 
+```{r harmony NOT NEED RUN in this case}
+pbmc.singlet <- RunHarmony(pbmc.singlet, group.by.vars = "orig.ident", reduction = "pca", dims.use = 1:50)
+
+# Here we use all PCs computed from Harmony for UMAP calculation
+#harmony_embeddings <- Embeddings(alldata, 'harmony')
+pbmc.singlet <- RunUMAP(pbmc.singlet, dims = 1:n_dim, reduction = "harmony", reduction.name = "umap_harmony")
+
+print(names(pbmc.singlet@reductions))
+print(names(pbmc.singlet@assays))
+
+```
+
+
+### Clustering
+
+```{r cluster basic, fig.width=10, fig.height=6}
+
+# We select the top 30 PCs for clustering and tSNE based on PCElbowPlot
+pbmc.singlet <- FindNeighbors(pbmc.singlet, reduction = "pca", dims = 1:n_dim)
+pbmc.singlet <- FindClusters(pbmc.singlet, resolution = 0.6, verbose = FALSE)
+pbmc.singlet <- RunTSNE(pbmc.singlet, reduction = "pca", dims = 1:n_dim)
+pbmc.singlet <- RunUMAP(pbmc.singlet, reduction = "pca", dims = 1:n_dim)
+
+# Projecting singlet identities on TSNE visualization
+plot_grid(ncol = 3, 
+  DimPlot(pbmc.singlet, group.by = "orig.ident", reduction = 'umap') +  ggtitle('umap')  ,
+  DimPlot(pbmc.singlet, group.by = "orig.ident", reduction = 'tsne') +  ggtitle('tsne')  ,
+  DimPlot(pbmc.singlet, group.by = "orig.ident", reduction = 'umap_harmony') +   ggtitle('harmony_umap')  ,
+  DimPlot(pbmc.singlet, group.by = "HTO_classification", reduction = 'umap') +    ggtitle('umap of samples')  ,
+  DimPlot(pbmc.singlet, group.by = "HTO_classification", reduction = 'tsne') +  ggtitle('tsne')  ,
+  DimPlot(pbmc.singlet, group.by = "HTO_classification", reduction = 'umap_harmony') +  ggtitle('harmony_umap')  
+)
+
+# no big different in batches (muestra1 and muestra2), so it is OK that no run harmony 
+# Umap is better than tSNE
+
+```
+
+
+
+```{r cluster by snn}
+# building graph
+pbmc.singlet@active.assay
+
+#pbmc.singlet@reductions$umap_raw = pbmc.singlet@reductions$umap
+
+pbmc.singlet <-  FindNeighbors(pbmc.singlet, dims = 1:n_dim, reduction = "umap") #reduction = 'umap_harmony'
+
+# check the names for graphs in the object.
+names(pbmc.singlet@graphs)
+
+# Clustering with louvain (algorithm 1)
+for (res in c(0.1, 0.25, 0.75,  0.5, 1, 1.5, 2)) {
+    pbmc.singlet <- FindClusters(pbmc.singlet, graph.name = "RNA_snn", resolution = res, algorithm = 1 )
+}
+
+plot_grid(ncol = 4, 
+    #DimPlot(pbmc.singlet, reduction = "umap", group.by = "orig.ident") + ggtitle("UMAP raw_data"),
+    DimPlot(pbmc.singlet, reduction = "umap", group.by = "orig.ident") + ggtitle("UMAP "),
+    DimPlot(pbmc.singlet, reduction = "umap", label =  T, group.by = "RNA_snn_res.0.25") +  ggtitle("louvain_0.25") , 
+    DimPlot(pbmc.singlet, reduction = "umap", label =  T, group.by = "RNA_snn_res.0.5") +  ggtitle("louvain_0.5") , 
+    DimPlot(pbmc.singlet, reduction = "umap", label =  T, group.by = "RNA_snn_res.0.75") +  ggtitle("louvain_0.75") , 
+    DimPlot(pbmc.singlet, reduction = "umap", label = T, group.by = "RNA_snn_res.1") +  ggtitle("louvain_1"), 
+    DimPlot(pbmc.singlet, reduction = "umap",label = T,  group.by = "RNA_snn_res.1.5") +  ggtitle("louvain_1.5"),
+    DimPlot(pbmc.singlet, reduction = "umap",  group.by = "RNA_snn_res.2", label = T) +  ggtitle("louvain_2")
+    
+    )
+
+ggsave('results/dimplot.resoultionSelect.png', w = 12, h = 6) 
+#res = 0.75
+res = 1
+
+
+```
+
+
+```{r plot clustree}
+clustree(pbmc.singlet@meta.data, prefix = "RNA_snn_res.")
+```
+
+
+
+```{r plot features}
+myfeatures <- c("CD3E", "CD4", "CD8A", "NKG7", "GNLY", "MS4A1", "CD14", "LYZ", "MS4A7", 
+    "FCGR3A", "CST3", "FCER1A", "CD68", "CD14")
+FeaturePlot(pbmc.singlet, reduction = "umap_harmony", dims = 1:2, features = myfeatures, ncol = 3,   order = T)
+
+
+```
+## save
+```{r}
+saveRDS(pbmc.singlet, 'results/02_qc_rd_harmony.singlet.rds')
+```
+
+
+# DEGs
+*** 
+
+Firstly, find marker genes for each cluster.
+```{r}
+alldata <- readRDS("results/02_qc_rd_harmony.singlet.rds")
+
+# Set the identity as louvain with resolution 0.5
+#sel.clust = "RNA_snn_res.0.75" # 2000 cells choose 0.5, 8000-1000 choose 1
+sel.clust = "RNA_snn_res.1" # 2000 cells choose 0.5, 8000-1000 choose 1
+
+alldata <- SetIdent(alldata, value = sel.clust)
+table(alldata@active.ident)
+```
+
+```{r plot}
+dir.create('plots/')
+# plot this clustering
+plot_grid(ncol = 3,
+          DimPlot(alldata, reduction = "umap", label = T) + NoAxes(), 
+          DimPlot(alldata, reduction = "umap", group.by = "orig.ident") + NoAxes(),
+          DimPlot(alldata, reduction = "umap", group.by = "HTO_classification") + NoAxes()
+)
+
+
+```
+
+
+## cell marker genes
+```{r find marker}
+# Compute differential expression
+markers_genes <- FindAllMarkers(alldata, logfc.threshold = 0.2, test.use = "wilcox", 
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = 50, 
+    assay = "RNA") %>% group_by(cluster) %>% filter(p_val_adj <= 0.05) 
+
+top25 <- markers_genes %>% group_by(cluster) %>% filter() %>% top_n(-25, p_val_adj)
+top25
+```
+
+
+```{r plot marker}
+top5 <- markers_genes %>% group_by(cluster) %>% top_n(-5, avg_log2FC)
+
+# create a scale.data slot for the selected genes
+alldata <- ScaleData(alldata, features = as.character(unique(top5$gene)), assay = "RNA" )
+DoHeatmap(alldata, features = as.character(unique(top5$gene)), group.by = sel.clust, 
+    assay = "RNA")
+
+ggsave(last_plot(), filename = 'plots/heatmap.makers.r1.pdf', w = 6, h = 8)
+```
+
+## Save
+```{r}
+saveRDS(alldata, "results/04_qc_dr_int_cl_dge.rds")
+write.csv(markers_genes, file = 'results/04_markergenes.csv')
+```
+
+# Cell type annotation
+
+## Method: ScPred
+
+ load reference 
+```{r ref}
+library(scPred)
+reference <- scPred::pbmc_1
+reference <- reference %>% 
+  NormalizeData() %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>%     
+  RunPCA(verbose = F) %>% 
+  RunUMAP(dims = 1:n_dim)
+
+DimPlot(reference, group.by = "cell_type", label = TRUE, repel = TRUE) + NoAxes()
+
+```
+
+
+```{r scPred}
+reference <- getFeatureSpace(reference, "cell_type")
+reference <- trainModel(reference)
+get_scpred(reference)
+
+alldata <- scPredict(alldata, reference)
+
+cowplot::plot_grid(ncol = 2, 
+    #DimPlot(all.cells, label = F, group.by = "orig.ident", reduction = 'umap_harmony') + NoAxes(),
+    DimPlot(alldata, label = T, group.by = "RNA_snn_res.1", reduction = 'umap') +  NoAxes(),  
+    #DimPlot(alldata, label = T, group.by = "RNA_snn_res.0.75", reduction = 'umap_harmony') +  NoAxes(), 
+    DimPlot(alldata, label = T, group.by = "scpred_prediction", reduction = 'umap') + NoAxes())
+
+
+```
+
+```{r celltype2cluster bar}
+#Now plot how many cells of each celltypes can be found in each cluster.
+ggplot(alldata@meta.data, 
+       aes(x = RNA_snn_res.1, fill = scpred_prediction)) + 
+  geom_bar() + theme_classic() + scale_fill_brewer(palette="Set1")
+```
+
+
+- manuputally correct
+
+```{r mannual correction}
+cell.types <- c("B cell","CD4 T cell","NK cell","cMono","CD8 T cell", "CD4 T cell",
+                "CD8 T cell","cMono","CD8 T cell","B cell","CD4 T cell", 
+                "CD8 T cell","CD4 T cell", 'unassigned',"ncMono", "CD8 T cell","B cell","cMono")
+
+alldata$celltype_scPred_manu <- plyr::mapvalues(alldata@active.ident, 0: (length(cell.types)-1) , cell.types )
+#alldata$Cell_type <- NULL
+
+# add scBCRseq correct
+alldata@meta.data %>% filter(!is.na(barcode)) %>% pull(celltype_scPred_manu) %>% table() # cells have bcr barcode
+alldata@meta.data %>% filter(is.na(barcode)) %>% pull(celltype_scPred_manu) %>% table() #cells have no bcr barcode
+
+# **Before run belowing command , grep the non-Bcells with bcr barcodes plot the markers**
+sup.b <- alldata[, !is.na(alldata$barcode) & !grepl('B cell', alldata$celltype_scPred_manu) ]
+FeaturePlot(sup.b, reduction = "umap", dims = 1:2, features = myfeatures, ncol = 3,   order = T) +
+  DimPlot(sup.b, group.by = "celltype_scPred_manu", reduction = 'umap' )
+## From the featurePlot, infer: unassigned is B cells, NK, CD8T , CD4T, cMono is doublets, 
+
+ggsave(last_plot() , filename =  'plots/featurePlot.otherCelltypewithBCR.pdf')
+
+```
+
+
+```{r manually correct cell types}
+
+alldata@meta.data <- alldata@meta.data %>% mutate(scVDJ = if_else(!is.na(barcode), 'True', 'False'))
+alldata@meta.data <- alldata@meta.data %>% mutate(Cell_type = if_else(!is.na(barcode) & celltype_scPred_manu == 'unassigned', 'B cell',
+                                                                      if_else(!is.na(barcode) & !celltype_scPred_manu %in% c('unassigned', 'B cell'), 'doublets',
+                                                                              as.character(celltype_scPred_manu))))  # 
+
+# Remove doublets
+
+alldata <- subset(alldata, Cell_type != 'doublets')
+
+# Major cell type
+alldata@meta.data <- alldata@meta.data %>% 
+  mutate(major_cell_type = if_else(grepl('T cell', Cell_type) , 'T cell',  
+                                   if_else(grepl('Mono', Cell_type), 'Monocyte',
+                                   Cell_type)))
+
+
+
+cowplot::plot_grid(ncol = 2, 
+    #DimPlot(all.cells, label = F, group.by = "orig.ident", reduction = 'umap_harmony') + NoAxes(),
+    #DimPlot(alldata, label = T, group.by = "RNA_snn_res.0.5", reduction = 'umap_harmony') +  NoAxes(), 
+    DimPlot(alldata, label = T, group.by = "RNA_snn_res.1", reduction = 'umap_harmony') +  NoAxes(), 
+    DimPlot(alldata, label = T, group.by = "Cell_type", reduction = 'umap_harmony') + NoAxes())
+
+
+# save annotated data
+saveRDS(alldata, "results/05.1_BCRcorrect_allcelltypes.rds")
+saveRDS(subset(alldata, subset = major_cell_type == 'B cell'), "results/06.1_Bcell.rds")
+saveRDS(subset(alldata, subset = major_cell_type %in% c('T cell') ), "results/06.1_Tcell.rds")
+saveRDS(subset(alldata, subset = major_cell_type == 'Monocyte' ), "results/06.1_Mono.rds")
+saveRDS(subset(alldata, subset = major_cell_type == 'NK cell' ), "results/06.1_NK.rds")
+
+```
+
+
+
+```{r plot dim}
+
+# plot sammples
+ggsave( DimPlot(alldata, reduction = "umap", group.by = "HTO_classification") + NoAxes()  +  NoLegend() + labs(title = 'Vaccine group') +
+           scale_color_manual(values = color_sample),
+        filename =  'plots/dimplot.HTO.pdf', w = 12, h = 9)
+
+ggsave( DimPlot(alldata, reduction = "umap", group.by = "HTO_classification") + NoAxes()  +labs(title = 'Vaccine group') +
+           scale_color_manual(values = color_sample),
+        filename =  'plots/dimplot.HTO.legend.pdf', w = 12, h = 9)
+
+# plot VDJ
+ggsave( DimPlot(alldata, reduction = "umap", group.by = "scVDJ") + NoAxes()  +labs(title = 'scVDJ') +
+           scale_color_manual(values = color_tf) + theme(panel.background = element_rect(fill = 'white', colour = 'black', size = 2)),
+        filename =  'plots/dimplot.VDJ.legend.pdf', w = 12, h = 9)
+
+
+# plot cell type
+ggsave( DimPlot(alldata, reduction = "umap", group.by = "major_cell_type", repel = T, label = T, label.size = 7) + NoAxes() +  NoLegend()+  labs(title = 'Cell identities') + scale_color_brewer(palette="Set2") + theme(panel.background = element_rect(colour = 'black', size = 2)) ,
+        filename =  'plots/dimplot.major.celltypes.pdf', w = 12, h = 9)
+
+ggsave( DimPlot(alldata, reduction = "umap", group.by = "major_cell_type", repel = T, label = T, label.size = 7) + NoAxes() +  labs(title = 'Cell identities') + scale_color_brewer(palette="Set2") + theme(panel.background = element_rect(colour = 'black', size = 2)) ,
+        filename =  'plots/dimplot.major.celltypes.legend.pdf', w = 12, h = 9)
+
+
+```
+
+
+
+```{r plot markers}
+# define markers
+
+
+markers.B           <- c("CD19","MS4A1","CD79A","CD79B")
+markers.T            <- c("CD3D","CD3E","CD3G")
+markers.Mono        <- c('CD14', 'FCGR3A')
+markers.NK          <- c("KLRC1","KLRD1","KLRF1")
+markers.pDC         <- c("NRP1","CLEC4C")
+#isotype.genes     <- c('IGHM', "IGHD", "IGHG1", 'IGHG2', 'IGHG3', 'IGHG4', 'IGHA1', 'IGHA2')
+#myeloid.genes     <- c("LYZ","CD68","CD14","LAMP3","CLEC9A","IRF7")
+#caf.genes         <- c("COL1A1","COL3A1")
+
+
+celltype.exp <- cbind(colMeans(alldata@assays$RNA@data[markers.B,]),
+                      colMeans(alldata@assays$RNA@data[markers.T,]),
+                      colMeans(alldata@assays$RNA@data[markers.Mono,]),
+                      colMeans(alldata@assays$RNA@data[markers.NK,]),
+                      colMeans(alldata@assays$RNA@data[markers.pDC,]))
+colnames(celltype.exp) <- c("B","T","Mono","NK","pDC")
+
+# plot by expression 
+meta.multi_features <- cbind( celltype.exp, alldata@reductions$umap@cell.embeddings)
+plot_multiFeature_grad <- function( cell){
+   ggplot(as.data.frame(meta.multi_features), aes(x=UMAP_1, y=UMAP_2, color=get(cell))) + 
+   geom_point(size = 0.1) +
+   scale_color_gradient(low = "gray", high = "red") +
+   #scale_color_gradientn(colors = c("gray","gray","red","red","red")) +
+   labs(title = paste0(cell, ' (', str_c(get(paste0('markers.',cell)), collapse = ','), ')')) +
+   theme(panel.background = element_rect(fill = 'white', colour = 'black', size = 2),
+         plot.background = element_rect(fill = 'white'),
+         panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank())
+  
+  ggsave(last_plot(),  filename =  paste0('plots/mark.', cell, '.expGradient.pdf'), w = 8, h = 8)
+ }
+mapply(plot_multiFeature_grad, c('B', 'T', 'NK', 'Mono', 'pDC' ))
+
+# plot by DImplot if exp > 1
+celltype.exp[celltype.exp >= 1] <- 'True'
+celltype.exp[celltype.exp < 1] <- 'False'
+alldata@meta.data <- alldata@meta.data %>% cbind(celltype.exp)
+
+plot_multiFeature <- function( cell){
+ # cell = 'B'
+  ggsave( DimPlot(alldata, reduction = "umap", group.by = cell, repel = T, label = F, label.size = 7, ) + 
+          NoAxes() +  NoLegend()+  
+          labs(title = paste0(cell, ' (', str_c(get(paste0('markers.',cell)), collapse = ','), ')')) +
+           scale_color_manual(values = color_tf) +
+          theme(panel.background = element_rect(colour = 'black', size = 1)) ,
+        filename =  paste0('plots/mark.', cell, '.expMT1.pdf'), w = 8, h = 8)
+
+}
+
+mapply(plot_multiFeature, c('B', 'T', 'NK', 'Mono', 'pDC' ))
+
+
+
+```
+
+
+```{r plot sample distribution}
+order_major.cell.type= c('B cell', 'T cell', 'NK cell', 'Monocyte', 'pDC' )
+
+df.sample.cell = alldata@meta.data %>% dplyr::select(HTO_classification, major_cell_type ) %>% 
+  group_by(major_cell_type, HTO_classification) %>% summarise(N_cells = n()) %>% 
+  ungroup() %>% group_by(HTO_classification) %>%   mutate(`% of cells` = N_cells/sum(N_cells)*100) %>% 
+  mutate(major_cell_type = factor(major_cell_type, levels = order_major.cell.type ))
+
+# total cells for each cell types
+p.mc.1 <- ggplot(alldata@meta.data %>% dplyr::select(HTO_classification, major_cell_type ) %>% 
+          mutate(major_cell_type = factor(major_cell_type, levels = order_major.cell.type )) , 
+       aes( x = major_cell_type,  fill = HTO_classification)) +
+  geom_bar() +
+  #facet_wrap( ~ major_cell_type) +
+  scale_fill_manual(values = color_sample) +
+  ylab('No. of cells') +
+  theme_pubr() +   rremove('xlab')
+
+# total cells for each sample
+p.mc.2 <-ggplot(alldata@meta.data %>% dplyr::select(HTO_classification, major_cell_type ) %>% 
+          mutate(major_cell_type = factor(major_cell_type, levels = order_major.cell.type )) , 
+       aes( fill = major_cell_type,  x = HTO_classification)) +
+  geom_bar() + 
+  #facet_wrap( ~ major_cell_type) +
+  scale_fill_brewer(palette="Set2") +
+  ylab('No. of cells') +
+  theme_pubr() +  rremove('xlab')
+
+         
+# proport of cells for each sample
+p.mc.3 <-ggbarplot(df.sample.cell, x = 'HTO_classification', y = '% of cells', 
+          position = position_identity(),
+          facet.by =  'major_cell_type', nrow = 1, 
+          #scale = 'free_y',
+          fill = 'HTO_classification', palette = color_sample) +
+  rremove('legend') + rremove('xlab')
+
+# proportion of cells for each sample by piechart
+p.mc.4 <- ggpie::ggpie(df.sample.cell %>% splitstackshape::expandRows('N_cells', count.is.col = T), 
+             major_cell_type, HTO_classification, 
+             border.color="white", label.color="black", percent = T, digits = 1, 
+             offset=0.7, label.size=3, legend=T) + 
+  theme(legend.position= "bottom") 
+          
+eoffice::topptx(p.mc.4 , filename = outfile, append = T, width = 10, height = 2, title = paste0(' % cells of cell types '))
+eoffice::topptx(p.mc.3 , filename = outfile, append = T, width = 10, height = 2, title = paste0(' % cells of cell types '))
+eoffice::topptx(p.mc.1 + p.mc.2 , filename = outfile, append = T, width = 10, height = 3, title = paste0(' No. cells  '))
+#eoffice::topptx(p.mc.3 , filename = outfile, append = T, width = 12, height = 2, title = paste0(' % cells of cell types free_y'))
+
+
+```
+
+
+
+
+
+# Different Group
+```{r cell types}
+
+tmp.marker <- data.frame()
+
+for (i in unique(alldata$Cell_type)) {
+  aaa <- subset(alldata, subset = Cell_type == i)
+  Idents(aaa) <- "HTO_classification"
+  aaa.marker <- FindAllMarkers(aaa)
+  aaa.marker$OrigClus <- i
+  tmp.marker <- rbind(tmp.marker,aaa.marker)
+}
+
+gene.celltypes.f = tmp.marker %>% filter(p_val_adj <= 0.05) %>% 
+ #filter(avg_log2FC >= 0.5) %>% 
+  filter(pct.1 >0.4 & pct.2 < 0.6) %>% 
+  identity()
+
+write_tsv(gene.celltypes.f %>% select(Gene = gene,`vaccine group` = cluster, `cell types` = OrigClus, 
+                                      `p value` = p_val, `adjust p value` = p_val_adj,
+                                      `in-group fraction` = pct.1, `out-group fraction` = pct.1 ),
+          'results/VariableGenesinEachVaccineGroup.perCelltypes.xls')
+```
+
+
+## stat cell numbers
+```{r}
+alldata = readRDS("202201/results/05.1_BCRcorrect_allcelltypes.rds")
+
+doublets = c(read_lines('q.b.cells/Doublet.B_T.list'), read_lines('q.b.cells/Doublet.B_Myeloid.list'))
+alldata = subset(alldata,cells = doublets, invert = T)
+saveRDS(alldata, 'results/08_allcells.rmDoublets.rds')
+
+
+cell.stat = table(alldata$major_cell_type, alldata$HTO_classification)  %>% as.data.frame() %>% 
+  group_by(Var2) %>% mutate(total_cells = sum(Freq)) %>% 
+  ungroup() %>% mutate(percent = round(Freq/total_cells * 100,1))
+
+cell.stat %>% group_by(Var1) %>% summarise(median = median(percent))
+
+write_tsv(cell.stat, file = 'results/CellType.stat.xls')
+```
+
+
+## check potential doublets (T cells)
+```{r doublets-T}
+TB.cells = read_lines('q.b.cells/Doublet.B_T.list')
+T.singlet = alldata@meta.data %>% filter(major_cell_type == 'T cell') %>% rownames_to_column('CellBarcode') %>% pull(CellBarcode)
+
+
+FeaturePlot(alldata, cells = c(TB.cells, T.singlet), features = markers.T, ncol = 3)
+ggsave( FeaturePlot(alldata, cells = c(TB.cells, T.singlet), features = markers.T, ncol = 3) & NoAxes() &  
+          theme(panel.background = element_rect(colour = 'black', size = 2)) ,
+         filename =   paste0('plots/',reduction, '.doublets.T.pdf'), w = 9, h = 3)
+```
+

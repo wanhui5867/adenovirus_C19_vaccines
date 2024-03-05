@@ -1,0 +1,201 @@
+---
+title: "hashtag_scRNA"
+author: "hui.wan"
+date: "12/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = F, message = F)
+knitr::opts_knit$set(root.dir = '~/OneDrive - KI.SE/Mac/Project/cowork/20211210_scRNA_hybridvaccine/')
+```
+
+```{r load pkgs}
+library(Seurat)
+library(patchwork)
+library(tidyverse)
+library(cowplot)
+library(Matrix)
+library(DoubletFinder)
+library(scRepertoire)
+library(harmony)
+library(clustree)
+library(scPred)
+library(RColorBrewer)
+library(ggpubr)
+library(eoffice)
+
+```
+
+# Description
+
+*Aim*:
+This experiment seeks to understand the hybrid immunity induced by either Cansino vs. AstraZeneca vaccines. 
+
+*Expermient*:
+We have only two reactions. Each reaction has five pools, and each pool has three samples. Samples include patients vaccinated with Cansino or AstraZeneca, with previous or no infection. Each reaction have data for VDJ, GEX, and HashTag.
+
+*Analysis*:
+0. Alignment: CellRanger multi (done)
+1. Merge data 
+2. QC: filter MT
+3. Dimensionality reduction, BatchEffector, Clustering
+4. Annotation: 
+5. scRNAseq: DEGs among vaccine, and different cell types
+6. scBCRseq: VDJ recombination. isotype
+
+## set variables
+```{r gloable vars}
+order_sample = c( "AZ", "AZ-hb", 'Cso', 'Cso-hb', "Inf")
+color_sample = structure( brewer.pal(6, 'Paired')[c(1,2,3,4,5)],
+                          names = c('Cso', 'Cso-hb', "AZ", "AZ-hb", "Inf"))
+
+color_tf = structure(brewer.pal(9, 'Set1')[c(1,9)], names = c('True', 'False'))
+
+outfile = 'plots/plot_20230401.pptx'
+```
+
+
+# Dimplot
+
+## all cells
+```{r all cells}
+w = 6
+h = 6
+reduction = 'umap'
+
+alldata <- read_rds('results/04_qc_dr_int_cl_dge.rds')
+
+# plot sammples
+ggsave( DimPlot(alldata, reduction = "umap", group.by = "HTO_classification", repel = T, label = F, label.size = 7) + NoAxes()  +  NoLegend() + 
+           scale_color_manual(values = color_sample) +
+            theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =  'Figures/dimplot.allcell.HTO.pdf', w = w, h = h)
+
+
+# plot major cell type
+ggsave( DimPlot(alldata, reduction = "umap", group.by = "major_cell_type", repel = T, label = T, label.size = 7) + NoAxes() +  NoLegend()+  
+          scale_color_brewer(palette="Set2") + 
+          theme(panel.background = element_rect(colour = 'black', size = 2)) ,
+        filename =  'Figures/dimplot.major.celltypes.pdf',w = w, h = h)
+
+
+
+```
+
+
+## B cells
+```{r all cells}
+w = 6
+h = 6
+reduction = 'umap'
+
+
+
+# plot sammples
+ggsave( DimPlot(alldata, reduction = "umap", group.by = "HTO_classification", repel = T, label = F, label.size = 7) + NoAxes()  +  NoLegend() + 
+           scale_color_manual(values = color_sample) +
+            theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =  'Figures/dimplot.allcell.HTO.pdf', w = w, h = h)
+
+
+# plot major cell type
+ggsave( DimPlot(alldata, reduction = "umap", group.by = "major_cell_type", repel = T, label = T, label.size = 7) + NoAxes() +  NoLegend()+  
+          scale_color_brewer(palette="Set2") + 
+          theme(panel.background = element_rect(colour = 'black', size = 2)) ,
+        filename =  'Figures/dimplot.major.celltypes.pdf',w = w, h = h)
+
+
+
+```
+
+
+## B cells
+```{r dimplot}
+w = 6
+h = 6
+reduction = 'umap'
+#reduction = 'tsne'
+
+q.all.nb <- read_rds('Figures/Bcells.rds')
+
+# plot samples
+ggsave( DimPlot(q.all.nb, reduction = reduction, group.by = "HTO_classification") + NoAxes()  +  NoLegend() + 
+           scale_color_manual(values = color_sample) + NoLegend() +
+          theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =   paste0('Figures/',reduction, '.sample.F.pdf'), w = w, h = h)
+
+
+
+# plot cell type
+ggsave( DimPlot(q.all.nb, reduction = reduction, group.by = "b.cell.types", repel = T, label = T, label.size = 7) + NoAxes() +  NoLegend()+  
+            labs(title = 'Cell identities') + scale_color_brewer(palette="Set2") + theme(panel.background = element_rect(colour = 'black', size = 2)) ,
+         filename =   paste0('Figures/',reduction, '.celltypes.F.pdf'), w = w, h = h)
+ 
+
+
+#plot isotype
+ggsave( DimPlot(q.all.nb, reduction = reduction, group.by = "isotype") + NoAxes()  +  NoLegend()+  
+           scale_color_manual(values = col_isotype) + 
+          theme(panel.background = element_rect(fill = 'white', colour = 'black', size = 2)),
+        filename =   paste0('Figures/',reduction, '.VDJ.isotype.F.pdf'), w = w, h = h)
+
+
+# plot samples
+for (sample in order_sample) {
+  q.all.nb@meta.data[sample] <- if_else(q.all.nb$HTO_classification == sample, 'True', "False")
+
+  ggsave( DimPlot(q.all.nb, reduction = reduction, group.by = sample, repel = T, label = F, label.size = 7) + NoAxes()  +  NoLegend() + 
+          labs(title = sample ) + 
+          #scale_color_manual(values = structure(c(color_sample[sample], '#999999'), names = c('True', 'False' ))) +
+          scale_color_manual(values = color_tf) +
+          theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =  paste0('Figures/','sample.', sample, '.T.pdf'), w = w, h = h)
+
+}
+
+```
+
+
+
+## T cells
+
+```{r dimplot}
+w = 6
+h = 6
+
+reduction = 'umap'
+sel.clust = "RNA_snn_res.2" 
+
+q.all.t.filter <- read_rds('Figures/Tcells.rds')
+
+# plot samples
+ggsave( DimPlot(q.all.t.filter, reduction = reduction, group.by = 'HTO_classification') + NoAxes()  +  NoLegend() + 
+          scale_color_manual(values = color_sample) +
+          theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =  paste0('Figures/',reduction, 'sample.F.pdf'), w = w, h = h)
+
+
+
+# plot cell type
+ggsave( DimPlot(q.all.t.filter, reduction = reduction, group.by = "t.cell.types", repel = T, label = T, label.size = 7) + NoAxes() +  NoLegend()+  
+          #scale_color_brewer(palette="Set2") + 
+          theme(panel.background = element_rect(colour = 'black', size = 2)) ,
+         filename =   paste0('Figures/',reduction, '.celltypes.F.pdf'), w = w, h = h)
+ 
+
+# plot for each sample 
+for (sample in order_sample) {
+  q.all.t.filter@meta.data[sample] <- if_else(q.all.t.filter$HTO_classification == sample, 'True', "False")
+
+  ggsave( DimPlot(q.all.t.filter, reduction = reduction, group.by = sample, repel = T, label = F, label.size = 7) + NoAxes()  +  NoLegend() + 
+          labs(title = sample ) + 
+          #scale_color_manual(values = structure(c(color_sample[sample], '#999999'), names = c('True', 'False' ))) +
+          scale_color_manual(values = color_tf) +
+          theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =  paste0('Figures/','sample.', sample, '.T.pdf'), w = w, h = h)
+
+}
+
+
+```

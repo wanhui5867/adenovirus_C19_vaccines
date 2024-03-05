@@ -1,0 +1,1156 @@
+---
+title: "b.subset"
+author: "hui.wan"
+date: "1/24/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = F, message = F)
+knitr::opts_knit$set(root.dir = '~/OneDrive - Karolinska Institutet//Mac/Project/cowork/20211210_scRNA_hybridvaccine/')
+```
+
+```{r load pkgs}
+library(Seurat)
+library(patchwork)
+library(tidyverse)
+library(cowplot)
+library(Matrix)
+library(DoubletFinder)
+library(scRepertoire)
+library(harmony)
+library(clustree)
+library(scPred)
+library(RColorBrewer)
+library(ggpubr)
+library(eoffice)
+library(grid)
+library(EnhancedVolcano)
+```
+
+## set variables
+```{r gloable vars}
+color_sample = structure( brewer.pal(6, 'Paired')[c(1,2,3,4,5)],
+                          names = c('Cso', 'Cso-hb', "AZ", "AZ-hb", "Inf"))
+
+color_tf = structure(brewer.pal(9, 'Set1')[c(1,9)], names = c('True', 'False'))
+
+col_isotype = structure( brewer.pal(8, 'Paired'),
+                          names = c('IGHD', 'IGHM', "IGHA1", "IGHA2", "IGHG1", "IGHG2", "IGHG3", "IGHG4"))
+
+
+outfile = 'q.b.rmDobulets/plotSamples.pptx'
+```
+
+
+
+```{r functions}
+myheatmap <- function(mat, ...) {
+    bk = c(seq(-2,2,0.1))
+   pheatmap(mat,
+            color=c(colorRampPalette(colors = c("blue","black"))(length(bk)/2),colorRampPalette(colors = c("black","yellow"))(length(bk)/2)),
+            show_rownames=T,
+            show_colnames=T,
+            scale="row",
+            breaks = bk,
+            clustering_distance_rows = "correlation",
+            clustering_distance_cols = "correlation",
+            clustering_method = "complete", ...
+            )
+ 
+} 
+#myheatmap(avgexp)
+
+
+myheatmap.orderRow <- function(mat) {
+    bk = c(seq(-2,2,0.1))
+   pheatmap(mat,
+            color=c(colorRampPalette(colors = c("blue","black"))(length(bk)/2),colorRampPalette(colors = c("black","yellow"))(length(bk)/2)),
+            show_rownames=T,
+            show_colnames=T,
+            scale="row",
+            cluster_rows = F, 
+            cluster_cols = F,
+            breaks = bk,
+            clustering_distance_rows = "correlation",
+            clustering_distance_cols = "correlation",
+            clustering_method = "complete"
+            )
+ 
+} 
+
+add.flag <- function(pheatmap,
+                     kept.labels,
+                     repel.degree) {
+  # repel.degree = number within [0, 1], which controls how much 
+  #                space to allocate for repelling labels.
+  ## repel.degree = 0: spread out labels over existing range of kept labels
+  ## repel.degree = 1: spread out labels over the full y-axis
+  heatmap <- pheatmap$gtable
+  new.label <- heatmap$grobs[[which(heatmap$layout$name == "row_names")]] 
+  # keep only labels in kept.labels, replace the rest with ""
+  new.label$label <- ifelse(new.label$label %in% kept.labels, 
+                            new.label$label, "")
+  # calculate evenly spaced out y-axis positions
+  repelled.y <- function(d, d.select, k = repel.degree){
+    # d = vector of distances for labels
+    # d.select = vector of T/F for which labels are significant
+    # recursive function to get current label positions
+    # (note the unit is "npc" for all components of each distance)
+    strip.npc <- function(dd){
+      if(!"unit.arithmetic" %in% class(dd)) {
+        return(as.numeric(dd))
+      }
+      d1 <- strip.npc(dd$arg1)
+      d2 <- strip.npc(dd$arg2)
+      fn <- dd$fname
+      return(lazyeval::lazy_eval(paste(d1, fn, d2)))
+    }
+    full.range <- sapply(seq_along(d), function(i) strip.npc(d[i]))
+    selected.range <- sapply(seq_along(d[d.select]), function(i) strip.npc(d[d.select][i]))
+    return(unit(seq(from = max(selected.range) + k*(max(full.range) - max(selected.range)),
+                    to = min(selected.range) - k*(min(selected.range) - min(full.range)), 
+                    length.out = sum(d.select)), 
+                "npc"))
+  }
+  new.y.positions <- repelled.y(new.label$y,
+                                d.select = new.label$label != "")
+  new.flag <- segmentsGrob(x0 = new.label$x,
+                           x1 = new.label$x + unit(0.15, "npc"),
+                           y0 = new.label$y[new.label$label != ""],
+                           y1 = new.y.positions)
+  # shift position for selected labels
+  new.label$x <- new.label$x + unit(0.2, "npc")
+  new.label$y[new.label$label != ""] <- new.y.positions
+  # add flag to heatmap
+  heatmap <- gtable::gtable_add_grob(x = heatmap,
+                                   grobs = new.flag,
+                                   t = 4, 
+                                   l = 4
+  )
+  # replace label positions in heatmap
+  heatmap$grobs[[which(heatmap$layout$name == "row_names")]] <- new.label
+  # plot result
+  grid.newpage()
+  grid.draw(heatmap)
+  # return a copy of the heatmap invisibly
+  invisible(heatmap)
+}
+
+
+# Volcano from FindMarkers result
+myVolcano <- function(res, ident.1, ident.2,  FCcutoff = log(1.2), pCutoff = 1e-02, ...) {
+  # FCcutoff = log(1.2)
+  # pCutoff = 1e-02
+  # ident.1 = "Bnaive-1"
+  # ident.2 = "Bnaive-2"
+  # show.genes = markers.b.activated
+  
+  res = res %>% 
+    mutate(color = if_else(avg_log2FC > FCcutoff & p_val_adj < pCutoff, 'red2', if_else(avg_log2FC < -FCcutoff & p_val_adj < pCutoff, 'royalblue', 'grey60')),
+           change = if_else(avg_log2FC > FCcutoff & p_val_adj < pCutoff, ident.1 , if_else(avg_log2FC < -FCcutoff & p_val_adj < pCutoff, ident.2, 'NS') ))
+  point.color.vec = res$color
+  names(point.color.vec) = res$change
+  
+  EnhancedVolcano(res,  #MODIFY
+                       lab = rownames(res), #MODIFY
+                       #selectLab = show.genes,
+                       x = 'avg_log2FC',
+                       y = 'p_val_adj',
+                       border = 'full',
+                       pCutoff = pCutoff,
+                       FCcutoff = FCcutoff,  # MODIFY
+                       cutoffLineWidth = 0.7,
+                       cutoffLineType = "dashed",
+                       pointSize = 2.0,
+                       labSize = 4.0,
+                       # point color default
+                       # col = c("grey60", "grey60", "grey60", "red2"),
+                       # legendLabels = c("NS", "avg_logFC", "p_val_adj", "p_val_adj & avg_logFC"),
+                       # point color by group
+                       colCustom = point.color.vec,
+                       colAlpha = 1,
+                       widthConnectors = 0.5,
+                       drawConnectors = TRUE,
+                       colConnectors = "black",
+                       title = paste(ident.1, 'vs', ident.2) , # MODIFY
+                       titleLabSize = 16, subtitle = NULL,
+                       legendLabSize = 16, legendPosition = 'right',
+                       caption = paste0("Log2 fold change cutoff: ", round(FCcutoff,2), "; p.ajust cutoff: ", pCutoff),
+                       ylab = bquote(~-Log[10]~"adj-p"), ...) +
+    theme(panel.background = element_rect(fill = 'white', colour = 'black', size = 1),
+          plot.background = element_rect(fill = 'white'),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank())
+
+}
+
+# markers_genes.naive.all <- FindMarkers(q.b.naive, ident.1 = "Bnaive-1", ident.2 = "Bnaive-2", min.pct = 0.1, logfc.threshold = 0)  # input res data
+# myVolcano(markers_genes.naive.all, ident.1 = "Bnaive-1", ident.2 = "Bnaive-2", FCcutoff = log(1.2), pCutoff = 1e-02 ) # label all changed genes
+# myVolcano(markers_genes.naive.all, ident.1 = "Bnaive-1", ident.2 = "Bnaive-2", selectLab = markers.b.activated ) # label selected genes
+
+# total cells for each cell types
+plotbar.total.cells <-function(meta){
+    ggplot(meta %>% select(HTO_classification, cluster ) %>% 
+          mutate(cluster = factor(cluster, levels = order_cluster )) , 
+       aes( x = cluster,  fill = HTO_classification)) +
+  geom_bar( width = 0.8) +
+  #facet_wrap( ~ cluster) +
+  scale_fill_manual(values = color_sample) +
+  ylab('No. of cells') +
+  theme_pubr() +   rremove('xlab')
+} 
+
+# total cells for each sample
+plotbar.total.samples <-function(meta){
+    ggplot(meta %>% select(HTO_classification, cluster ) %>% 
+          mutate(cluster = factor(cluster, levels = order_cluster )) , 
+       aes( fill = cluster,  x = HTO_classification)) +
+  geom_bar( width = 0.8) +
+  #facet_wrap( ~ cluster) +
+  scale_fill_brewer(palette="Set2") +
+  ylab('No. of cells') +
+  theme_pubr() +  rremove('xlab')
+} 
+
+         
+# proport of cells for each sample
+plotbar.sample.cell <-function(meta){
+    
+    df.sample.cell = meta %>% 
+        select(HTO_classification, cluster ) %>% 
+         group_by(cluster, HTO_classification) %>% 
+        summarise(N_cells = n()) %>% 
+        ungroup() %>% group_by(HTO_classification) %>%   
+        mutate(`% of cells` = N_cells/sum(N_cells)*100) %>% 
+        mutate(cluster = factor(cluster, levels = order_cluster ))
+        
+    
+    ggbarplot(df.sample.cell, x = 'HTO_classification', y = '% of cells', 
+              position = position_identity(),
+              facet.by =  'cluster', nrow = 1, 
+              #scale = 'free_y',
+              fill = 'HTO_classification', palette = color_sample) +
+      rremove('legend') + rremove('xlab')
+}
+
+
+# proport of cells for each sample
+plotbar.sample.gene <-function(meta){
+
+    ggboxplot(meta, x = 'HTO_classification', y = 'nFeature_RNA', 
+                 outlier.shape = NA, 
+              ylab = 'No. of genes per cell',
+              order = order_sample,
+              #position = position_identity(),
+              facet.by =  'cluster', nrow = 1, 
+              #scale = 'free_y',
+              fill = 'HTO_classification', palette = color_sample) +
+      rremove('legend') + rremove('xlab')
+}
+
+
+    ```
+
+
+*Aim*:
+To analysis the B-cell subsets of different vaccines   
+
+
+*Analysis*:
+1. combine scBCRseq
+2. subclustering 
+3. B cells Annotation: 
+4. scRNAseq: No.Cells, DEGs among vaccine, and different cell types
+5. BCRseq: SHM; diveristy; clonotype
+
+
+
+# 1. Sub-clustering
+```{r clustering}
+q.b<- readRDS( "results/08_B.removeDoublets.rds")
+
+q.b<- FindVariableFeatures(q.b)
+q.b<- ScaleData(object = q.b)
+q.b<- RunPCA(object = q.b)
+ElbowPlot(q.b, ndims = 40)
+nPcDim <- 10
+
+# UMAP
+q.b<- RunUMAP(q.b, dims=1:as.numeric(nPcDim), reduction="pca", min.dist = 0.1)
+
+# tSNE
+q.b<- RunTSNE(q.b, dims=1:as.numeric(nPcDim), reduction="pca", min.dist = 0.1)
+
+
+q.b<- FindNeighbors(q.b, dims=1:as.numeric(nPcDim), reduction="pca")
+q.b<- FindClusters(q.b, resolution = 0.5)
+
+# Clustering with louvain (algorithm 1)
+for (res in c(0.1, 0.25, 0.5, 0.75, 1, 1.5, 2)) {
+    q.b<- FindClusters(q.b, graph.name = "RNA_snn", resolution = res, algorithm = 1)
+}
+
+plot_grid(ncol = 4, 
+    DimPlot(q.b, reduction = "tsne", group.by = "orig.ident") + ggtitle("tSNE"),
+    DimPlot(q.b, reduction = "tsne", label =  T, group.by = "RNA_snn_res.0.5") +  ggtitle("louvain_0.5") , 
+    DimPlot(q.b, reduction = "tsne", label =  T, group.by = "RNA_snn_res.0.75") +  ggtitle("louvain_0.75") , 
+    DimPlot(q.b, reduction = "tsne", label =  T, group.by = "RNA_snn_res.1") +  ggtitle("louvain_1") 
+
+   )
+
+
+
+plot_grid(ncol = 4, 
+    DimPlot(q.b, reduction = "umap", group.by = "orig.ident") + ggtitle("UMAP"),
+    DimPlot(q.b, reduction = "umap_harmony", group.by = "orig.ident") + ggtitle("UMAP harmony"),
+    DimPlot(q.b, reduction = "umap", label =  T, group.by = "RNA_snn_res.0.25") +  ggtitle("louvain_0.25") , 
+    DimPlot(q.b, reduction = "umap", label =  T, group.by = "RNA_snn_res.0.5") +  ggtitle("louvain_0.5") , 
+    DimPlot(q.b, reduction = "umap", label =  T, group.by = "RNA_snn_res.0.75") +  ggtitle("louvain_0.75") , 
+    DimPlot(q.b, reduction = "umap", label =  T, group.by = "RNA_snn_res.1") +  ggtitle("louvain_1"), 
+    DimPlot(q.b, reduction = "umap", label =  T, group.by = "RNA_snn_res.1.5") +  ggtitle("louvain_1.5"),
+    DimPlot(q.b, reduction = "umap",  group.by = "RNA_snn_res.2", label = T) +  ggtitle("louvain_2")
+    
+   )
+
+# Set the identity as louvain with resolution 0.5
+sel.clust = "RNA_snn_res.0.5" # 2000 cells choose 0.5, 8000-1000 choose 1
+
+q.b<- SetIdent(q.b, value = sel.clust)
+table(q.b@active.ident)
+
+table(q.b$RNA_snn_res.1)
+
+```
+
+
+
+```{r plot markers, fig.height=2, fig.width=4}
+# plot features
+dir.create('q.b.rmDobulets')
+
+gs.Tbet = c('TBX21', 'CD19', 'MS4A1','ITGAX', 'FCRL2', 'FCRL3', 'FCRL5', 'CD72',  # +
+            'ENC1', 'ITGB2' , 'TNFRSF1B',  # +
+            'FCER2' , 'CD24', 'CD27', 'ITGAM' ,'SELL' , 'LTB' ) # -
+DotPlot(q.b,  features = gs.Tbet, dot.min = 0.1,  col.min = 0, dot.scale = 7) + RotatedAxis() # no Tbet
+
+
+gs.xf <- c('CD19', 'MS4A1',  'CD27', "IGHM","IGHD","IGHG1","IGHG2", "IGHA1","IGHA2", 'CD38', 'CD24','SDC1','PRDM1', 	'FCER2', 'CR2', 'CD1', 'CD5', 'CD9', 'ITGAM' )
+gs.xf2 <- c('XBP1',	'IL10',	'SPN', 	'TNFRSF13B', 'CD86',	'TNFRSF13c', 'CXCR4', 'CD138')
+gs.mexico <- c('MS4A1' ,'IGHD','NEIL1','CD27','MZB1','CD38', 'MKI67')
+gs.leire <- c('MKI67', 'H2AFZ', 'TUBA1B', 'TOP2A', 'TCL1A')
+gs.plamsa <- c('SDC1', 'CD44', 'CD1D', 'PRDM1',  'HAVCR1', 'LAG3' , 'CD274',  'EBI3' , 'CR2', 'FCER2') # SDC1 = CD138, PRDM1= BLIMP-1, HAVCR1 = TIM-1, CD274 = PD-L1, EBI3 = IL35, CR2 = CD21, FCER2=CD23
+gs.plamsa <- c('SDC1', 'CD44', 'CD1D') # CD44 & CD1D for B1 marker
+
+features <- c( gs.xf, gs.mexico, gs.xf2, gs.plamsa)
+
+# resoultion - 0.5
+avgexp <- AverageExpression(q.b, features = features, return.seurat = T)@assays$RNA@data
+
+myheatmap(avgexp)  # scaled by row
+pv.marker <- VlnPlot(object = q.b, features = features,   pt.size = 0, group.by = 'RNA_snn_res.0.5',  stack = T, same.y.lims = T) + NoLegend()
+
+q.b@active.ident
+b.cell.types <- c('Bnaive-2', 'Bnaive-1', 'Bmemory',  'plasmablast') 
+q.b$b.cell.types <- NULL
+q.b$b.cell.types <- plyr::mapvalues(q.b@active.ident, 0: (length(b.cell.types)-1) , b.cell.types )
+
+#Idents(q.b)   <- q.b$b.cell.types
+Idents(q.b)   <- q.b$b.cell.types
+pd.marker <- DotPlot(q.b,  cluster.idents = T,features = unique(features), dot.min = 0,  col.min = 0, dot.scale = 7) + RotatedAxis() + NoLegend()
+# pv.marker <- VlnPlot(object = q.b, features = features,  sort = T, pt.size = 0, group.by = 'b.cell.types',  stack = T, same.y.lims = T ) + NoLegend()
+# pv.marker <- VlnPlot(object = q.b, features = features,  sort = T, pt.size = 0, group.by = 'b.cell.types',  stack = T, same.y.lims = F ) + NoLegend()
+
+# # resolution = 1
+# avgexp1 <- AverageExpression(q.b, features = features, return.seurat = T, group.by = 'RNA_snn_res.1')@assays$RNA@data
+# myheatmap(avgexp1)
+# VlnPlot(object = q.b, features = features,   pt.size = 0, group.by = 'RNA_snn_res.1',  stack = T)+ NoLegend()
+# #c('Naive B 1', 'Naive B 2', 'mem?', 'Memory B', '', '','Naive B 2', '') 
+
+
+# eoffice::topptx(myheatmap(avgexp)  , filename = outfile, append = T, width = 6, height = 5, title = paste0(' heatmap of markers  '))
+# eoffice::topptx(pv.marker  , filename = outfile, append = T, width = 6, height = 5, title = paste0(' ViolinPlot of markers  '))
+eoffice::topptx(pd.marker  , filename = outfile, append = T, width = 6, height = 3, title = paste0(' Dotplot of markers  '))
+
+```
+
+
+```{r plot features}
+# plot features
+ggsave( FeaturePlot(object = q.b, features = features, cols = c("grey", "red"), reduction = 'umap',  pt.size = 0.5, min.cutoff = 0),
+        filename =  'q.b.rmDobulets/bcell.umap.markers.bmarkers.pdf', w = 20, h = 20)
+
+```
+
+
+
+
+# 2. DEGs
+```{r DEG among sample}
+Idents(q.b)   <- q.b$HTO_classification
+markers_genes.samples <- FindAllMarkers(q.b, logfc.threshold = 0.2, test.use = "wilcox", 
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = FALSE, slot = 'data',
+    assay = "RNA") %>% group_by(cluster) %>% filter(p_val_adj <= 0.05) 
+
+# DoHeatmap(q.b, markers_genes.samples$gene, size=3 )
+
+# average samples
+mat_ave_sample <- AverageExpression(q.b, return.seurat = T)@assays$RNA@data
+mat     <- mat_ave_sample[unique(markers_genes.samples$gene),]
+myheatmap(mat)
+
+eoffice::topptx(myheatmap(mat)  , filename = outfile, append = T, width = 6, height = 5, title = paste0(' heatmap of markers among samples (all B-cells)  '))
+write.table(markers_genes.samples, file="q.b.rmDobulets/DEG.markers.samples.txt", quote = F, sep='\t')
+
+```
+
+
+###  Different Group
+```{r DEGs among groups per cell types}
+
+tmp.marker <- data.frame()
+
+for (i in unique(q.b$b.cell.types)) {
+  aaa <- subset(q.b, subset = b.cell.types == i)
+  Idents(aaa) <- "HTO_classification"
+  aaa.marker <- FindAllMarkers(aaa)
+  aaa.marker$Bsubsets <- i
+  tmp.marker <- rbind(tmp.marker,aaa.marker)
+}
+
+gene.bcelltypes.f = tmp.marker %>% filter(p_val_adj <= 0.05) %>% 
+    select(Gene = gene,`vaccine group` = cluster, `cell types` = Bsubsets, 
+                                 `p value` = p_val,  `adjust p value` = p_val_adj, avg_log2FC = avg_log2FC,
+                                 `in-group fraction` = pct.1, `out-group fraction` = pct.2) %>% 
+ filter(avg_log2FC >= log2(1.5)) %>% 
+  #filter(pct.1 >0.4 & pct.2 < 0.6) %>% 
+  identity()
+
+# gene.bcelltypes.f %>% group_by(`vaccine group`, `cell types`) %>% summarise(n = n()) %>% spread(cluster, n)
+
+write_tsv(gene.bcelltypes.f,
+          'q.b.rmDobulets/VariableGenesinEachVaccineGroup.perCelltypes.xls')
+
+
+
+
+# for (i in unique(q.b$b.cell.types)) {
+#     gs <- gene.bcelltypes.f %>% filter(`cell types` == i ) %>% pull(Gene) %>% unique()
+#      
+#     topptx(myheatmap(mat_ave_sample[gs,]), filename = outfile, append = T, width = 3, height = 5, title = i)
+# }
+
+
+```
+
+
+- DEGs by cluster
+
+DEGs among clusters: need to consider cluster size and cluster similarity. 
+Btrasit, Bnaive, Bmemory' size is close, Btransit and Bnaive is similarity
+other cluster is too samll to compare with the above three. compared they togehter
+
+```{r DEGs among clusters}
+order_cluster  <- c('Bnaive-1', 'Bnaive-2', 'Bmemory', 'plasmablast') 
+
+Idents(q.b)   <- 'b.cell.types'
+levels(q.b)  <-  order_cluster
+
+
+markers_genes <- FindAllMarkers(q.b, logfc.threshold = log2(1.5), test.use = "wilcox", 
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE,  random.seed = 1234, 
+    assay = "RNA") %>% 
+    group_by(cluster) %>% filter(p_val_adj <= 0.05) 
+
+write_tsv(markers_genes, paste0('q.b.rmDobulets/', 'Bcelltypes.DEGs.xls'))
+
+
+
+top5 <- markers_genes %>% group_by(cluster) %>% top_n(-5, avg_log2FC)
+#DoHeatmap(q.b, top5$gene, size=3 )
+
+mat_ave_cluster <- AverageExpression(q.b, return.seurat = T)@assays$RNA@data
+mat_cluster     <- mat_ave_cluster[top5$gene,]
+
+myheatmap(mat_cluster)
+heat <- myheatmap(mat_ave_cluster[unique(markers_genes$gene), ])  # affected by cluster size
+
+# according to cluster order to order genes
+gene.order = markers_genes %>% 
+  arrange(match(cluster, c(  'Bnaive-1', 'Bnaive-2', 'plasmablast', 'Bmemory')), -avg_log2FC) %>% 
+  pull(gene) %>% unique()
+heat <- myheatmap.orderRow(mat_ave_cluster[gene.order, ])  # affected by cluster size
+
+
+#png(file = 'q.b.rmDobulets/heatmap.markers.cluster.png', h = 20, w = 14, units = 'in')
+pdf(file = 'q.b.rmDobulets/heatmap.markers.cluster.pdf', h = 7, w = 5)
+heat
+dev.off()
+
+pdf(file = 'q.b.rmDobulets/heatmap.markers.cluster.labletop.pdf', h = 7, w = 5)
+add.flag(heat, kept.labels = top5$gene,  repel.degree = 0.2)
+dev.off()
+
+
+# Vlnplot of important DEGs
+pv_markers <- VlnPlot(q.b, features =  c('JUN', 'FOS', 'CD83', 'CD69', 'NFKBIA',  'CXCR4'), 
+                      pt.size = 0, stack = T, flip = T, fill.by = 'ident', slot = 'data')  + NoLegend() +
+  stat_summary(fun.y = median, geom='point', size = 15, colour = "black", shape = 95)
+
+topptx(pv_markers, filename = outfile, append = T, width = 3, height = 4, title = 'DEGs for B cells ')
+
+
+# Dotplot of important 
+pd_markers <- DotPlot(q.b, features =  c('JUN', 'FOS', 'CD83', 'CD69', 'NFKBIA',  'CXCR4'), 
+                       dot.min = 0.1,  col.min = 0, dot.scale = 7) + RotatedAxis() 
+
+topptx(pd_markers, filename = outfile, append = T, width = 6, height = 2, title = 'DEGs for B cells ')
+
+# featureplot
+FeaturePlot(q.b, features =  c('JUN', 'FOS', 'CD83', 'CD69', 'NFKBIA',  'CXCR4'), pt.size = 0.5, reduction = 'umap')
+ggsave(last_plot(), filename = 'q.b.rmDobulets/Featureplot.DEGs.bcelltypes.pdf', w = 10, h = 12)
+```
+
+
+```{r pathway enrichment }
+library(clusterProfiler )
+b.cells = 'Bcelltypes'
+table(markers_genes$cluster) # check the data firstly
+
+# enrich go
+cluster.go <- compareCluster( gene ~ cluster, data = markers_genes,  fun="enrichGO", OrgDb = 'org.Hs.eg.db', keyType = 'SYMBOL', ont = 'BP' )
+pd_go <-dotplot(filter(cluster.go, qvalue<0.02),showCategory=5)
+#pd_go <-dotplot( cluster.go,showCategory=5)
+write_tsv(summary(cluster.go), paste0('q.b.rmDobulets/', b.cells,'.enrich.go.xls'))
+ggsave(pd_go, filename = paste0('q.b.rmDobulets/dotplot.', b.cells, '.enrichGO.pdf'), w = 10, h = 14)
+
+
+# enrich kegg
+id.sy2up = bitr(markers_genes$gene,  "SYMBOL",'UNIPROT', "org.Hs.eg.db")
+id.np2kegg <- bitr_kegg(id.sy2up$UNIPROT, fromType='uniprot' , toType='kegg', organism='hsa')
+mat.cl2kegg <- markers_genes %>% left_join(id.sy2up %>% dplyr::select(gene = SYMBOL, uniprot = UNIPROT)) %>% left_join(id.np2kegg)
+cluster.kegg <- compareCluster( kegg ~ cluster, data = mat.cl2kegg,  fun="enrichKEGG", organism = "hsa" )
+pd_kegg <-dotplot(filter(cluster.kegg, qvalue<0.01),showCategory=5)
+#pd_kegg <-dotplot(cluster.kegg, showCategory=5) # CD4
+
+write_tsv(summary(cluster.go), paste0('q.b.rmDobulets/', b.cells,'.enrich.kegg.xls'))
+ggsave(pd_kegg, filename = paste0('q.b.rmDobulets/dotplot.', b.cells, '.enrichKEGG.pdf'), w = 6, h = 6)
+
+
+
+# enrich wikipathway
+wp_gs <- read.gmt("ref/wikipathways-20220210-gmt-Homo_sapiens.gmt")
+id.sy2en <- bitr(wp_gs$gene,  'ENTREZID', "SYMBOL","org.Hs.eg.db")
+wp_gs_id <- wp_gs %>% 
+  dplyr::mutate(term = as.character(term),
+                term = str_remove_all(term,' \\- .*$'),
+                term = str_remove_all(term, '%Wiki.*$')) %>% 
+  left_join(id.sy2en %>% dplyr::select(gene = ENTREZID, SYMBOL)) %>% 
+  dplyr::select(term, gene = SYMBOL) %>% 
+  filter(!is.na(gene))
+
+cluster.wp <- compareCluster( gene ~ cluster, data = markers_genes,  fun="enricher", TERM2GENE = wp_gs_id )
+pd_wp <- dotplot(filter(cluster.wp, qvalue<0.01),showCategory=5)
+pd_wp <- dotplot(cluster.wp,showCategory=5) #CD4
+write_tsv(summary(cluster.wp), paste0('q.b.rmDobulets/', b.cells,'.enrich.wikipathway.xls'))
+ggsave(pd_wp, filename = paste0('q.b.rmDobulets/dotplot.', b.cells, '.enrichWikipathway.q01.pdf'), w =7, h = 8)
+
+
+```
+
+
+
+
+```{r DEGs naive-1 vs naive-2}
+
+
+# naive 1 vs 2 --------
+q.b.naive <- subset(q.b, idents = order_cluster[1:2])
+#q.b.naive <-  SetIdent(q.b.naive, value = 'HTO_classification')
+q.b.naive <-  SetIdent(q.b.naive, value = 'b.cell.types')
+
+markers_genes.naive <- FindAllMarkers(q.b.naive, logfc.threshold = log(1.2), test.use = "wilcox", 
+    min.pct = 0.1, min.diff.pct = 0.18, only.pos = T,  random.seed = 1234, 
+    assay = "RNA") %>% 
+    group_by(cluster) %>% filter(p_val_adj <= 0.05) 
+write_tsv(markers_genes.naive, 'q.b.rmDobulets/Bnaive1-vs-Bnavie2.tsv')
+# markers_genes.naive <- FindMarkers(q.b.naive, ident.1 = 'Bnaive-1', ident.2 = 'Bnaive-2', logfc.threshold = log(1.2), test.use = "wilcox", 
+#     min.pct = 0.1, min.diff.pct = 0.1, only.pos = T,  random.seed = 1234, 
+#     assay = "RNA") 
+
+
+
+```
+
+
+
+
+
+```{r violin plot}
+#activated B markers
+markers.b.activated <- c("CD83","CD69","JUND","DUSP1","CREM","FOS","AREG","JUNB")
+VlnPlot(q.b, features = markers.b.activated, pt.size = 0)
+
+
+markers.b.inf <- c("IFITM1","IFI35","IFIT1","IFIT2","IFIT3","IRF7","ISG15","CCSER1")
+VlnPlot(q.b, features = markers.b.inf, pt.size = 0)
+
+genes <- c("IFITM1", "AIF1", "CD83","CD69","JUND","DUSP1","FOS","JUNB")
+pv_markers <- VlnPlot(q.b, features = genes, pt.size = 0, stack = T, flip = T, fill.by = 'ident')  + NoLegend()
+
+topptx(pv_markers, filename = outfile, append = T, width = 5, height = 6, title = 'speicific markers for B cells ')
+
+```
+
+
+
+
+```{r volcano of B naive cells}
+### B niave 1 vs 2
+
+# select cells naive 1 vs 2 --------
+q.b.naive <- subset(q.b, idents = order_cluster[1:2])
+#q.b.naive <-  SetIdent(q.b.naive, value = 'HTO_classification')
+q.b.naive <-  SetIdent(q.b.naive, value = 'b.cell.types')
+
+markers_genes.naive.all <- FindMarkers(q.b.naive, ident.1 = "Bnaive-1", ident.2 = "Bnaive-2", min.pct = 0.1, logfc.threshold = 0) 
+save(markers_genes.naive.all, file = "q.b.rmDobulets/Bnaive1vs2.markers.Robj")
+
+#  volcano plot
+pV.naive.a <- myVolcano(markers_genes.naive.all, ident.1 = "Bnaive-1", ident.2 = "Bnaive-2", 
+                      FCcutoff = log2(1.5), pCutoff = 0.05 )
+ggsave(pV.naive.a, filename =  'q.b.rmDobulets/Volcano.Bnaive.allDiff.pdf', w = 7, h = 5)
+
+# select FC genes to label volcano
+select.genes <- c("CD83","CD69","JUND","DUSP1","FOS","AREG","JUNB", "JUN", "FOSB", "CXCR4", 'NFKBIA')
+pV.naive.f <- myVolcano(markers_genes.naive.all, ident.1 = "Bnaive-1", ident.2 = "Bnaive-2", 
+                        selectLab = select.genes, 
+                        #xlim = c(-2,2), 
+                      FCcutoff = log2(1.5), pCutoff = 0.05)
+
+ggsave(pV.naive.f, filename =  'q.b.rmDobulets/Volcano.Bnaive.selectgenes.pdf', w = 7, h = 5)
+
+# export the gene table
+markers_genes.naive <- FindAllMarkers(q.b.naive, logfc.threshold = log2(1.5), test.use = "wilcox", 
+    min.pct = 0.1, min.diff.pct = 0.18, only.pos = T,  random.seed = 1234, 
+    assay = "RNA") %>% 
+    group_by(cluster) %>% filter(p_val_adj <= 0.01) 
+write_tsv(markers_genes.naive, 'q.b.rmDobulets/Bnaive1-vs-Bnavie2.tsv') # the gene table
+
+```
+
+
+
+
+
+## DIMplot
+```{r dimplot}
+w = 6
+h = 6
+reduction = 'umap'
+# reduction = 'tsne'
+
+# plot samples
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "RNA_snn_res.0.5", repel = T, label = T, label.size = 7) + NoAxes()  +  NoLegend() + 
+          labs(title = paste0('B (', nrow(q.b@meta.data), ' cells)') ) + 
+          theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =  paste0('q.b.rmDobulets/',reduction, '.cluster.T.pdf'), w = w, h = h)
+
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "RNA_snn_res.0.5", repel = T, label = F, label.size = 7) + NoAxes()  +  NoLegend() + 
+          labs(title = paste0('B (', nrow(q.b@meta.data), ' cells)') ) + 
+          theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =    paste0('q.b.rmDobulets/',reduction, '.cluster.F.pdf'), w = w, h = h)
+
+# plot samples
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "HTO_classification") + NoAxes()  +  NoLegend() + labs(title = 'Sample') +
+           scale_color_manual(values = color_sample) +
+          theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =   paste0('q.b.rmDobulets/',reduction, '.sample.F.pdf'), w = w, h = h)
+
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "HTO_classification") + NoAxes()  +labs(title = 'Sample') +
+           scale_color_manual(values = color_sample)+
+           theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =   paste0('q.b.rmDobulets/',reduction, 'sample.T.pdf'), w = w, h = h)
+
+
+
+# plot cell type
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "b.cell.types", repel = T, label = T, label.size =9) + NoAxes() +  NoLegend()+  
+            labs(title = 'B cell subtype') + scale_color_brewer(palette="Set2") + theme(panel.background = element_rect(colour = 'black', size = 2)) ,
+         filename =   paste0('q.b.rmDobulets/',reduction, '.celltypes.F.pdf'), w = w, h = h)
+
+
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "b.cell.types", repel = T, label = F, label.size =9) + NoAxes() +  NoLegend()+  
+            labs(title = 'B cell subtype') + scale_color_brewer(palette="Set2") + theme(panel.background = element_rect(colour = 'black', size = 2)) ,
+         filename =   paste0('q.b.rmDobulets/',reduction, '.celltypes.FF.pdf'), w = w, h = h)
+  
+ggsave( DimPlot(q.b,reduction = reduction, group.by = "b.cell.types", repel = T, label = F, label.size = 9) + NoAxes() +  
+            labs(title = 'B cell subtype') + scale_color_brewer(palette="Set2") + theme(panel.background = element_rect(colour = 'black', size = 2)) ,
+     filename =   paste0('q.b.rmDobulets/',reduction, '.celltypes.T.pdf'), w = w, h = h)
+
+
+ # plot VDJ
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "scVDJ_paired") + NoAxes()  +labs(title = 'scVDJ') +
+           scale_color_manual(values = color_tf) + 
+          theme(panel.background = element_rect(fill = 'white', colour = 'black', size = 2)),
+        filename =   paste0('q.b.rmDobulets/',reduction, '.VDJ.pairedVHVL.pdf'), w = w, h = h)
+
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "scVDJ") + NoAxes()  +labs(title = 'scVDJ') +
+           scale_color_manual(values = color_tf) + 
+          theme(panel.background = element_rect(fill = 'white', colour = 'black', size = 2)),
+        filename =   paste0('q.b.rmDobulets/',reduction, '.VDJ.unpaired.pdf'), w = w, h = h)
+
+#plot isotype
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "isotype") + NoAxes()  +labs(title = 'Isotype from scVDJ') +
+           scale_color_manual(values = col_isotype) + 
+          theme(panel.background = element_rect(fill = 'white', colour = 'black', size = 2)),
+        filename =   paste0('q.b.rmDobulets/',reduction, '.VDJ.isotype.T.pdf'), w = 12, h = 9)
+
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "isotype") + NoAxes()  +  NoLegend()+  
+            labs(title = 'Isotype from scVDJ') +
+           scale_color_manual(values = col_isotype) + 
+          theme(panel.background = element_rect(fill = 'white', colour = 'black', size = 2)),
+        filename =   paste0('q.b.rmDobulets/',reduction, '.VDJ.isotype.F.pdf'), w = w, h = h)
+
+# plot SHM
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "SHM_VH_rank", na.value = 'gray') +
+            NoAxes()  + 
+            NoLegend()+  
+            labs(title = 'SHM from scVDJ') +
+           scale_color_brewer(palette = 'Set1') + 
+          theme(panel.background = element_rect(fill = 'white', colour = 'black', size = 2)),
+        filename =   paste0('q.b.rmDobulets/',reduction, '.SHM.isotype.F.pdf'), w = w, h = h)
+
+ggsave( DimPlot(q.b, reduction = reduction, group.by = "SHM_VH_rank", na.value = 'gray') +
+            NoAxes()  + 
+            #NoLegend()+  
+            labs(title = 'SHM from scVDJ') +
+           scale_color_brewer(palette = 'Set1') + 
+          theme(panel.background = element_rect(fill = 'white', colour = 'black', size = 2)),
+        filename =   paste0('q.b.rmDobulets/',reduction, '.SHM.isotype.T.pdf'), w = w, h = h)
+```
+
+
+
+
+```{r dimplot sample}
+w = 6
+h = 6
+
+reduction = 'umap'
+sel.clust = "RNA_snn_res.0.5"  
+
+
+# plot samples
+for (sample in order_sample) {
+  q.b@meta.data[sample] <- if_else(q.b$HTO_classification == sample, 'True', "False")
+
+  ggsave( DimPlot(q.b, reduction = reduction, group.by = sample, repel = T, label = F, label.size = 7) + NoAxes()  +  NoLegend() + 
+          labs(title = sample ) + 
+          #scale_color_manual(values = structure(c(color_sample[sample], '#999999'), names = c('True', 'False' ))) +
+          scale_color_manual(values = color_tf) +
+          theme(panel.background = element_rect(colour = 'black', size = 2))  ,
+        filename =  paste0('q.b.rmDobulets/','sample.', sample, '.T.pdf'), w = w, h = h)
+
+}
+
+```
+
+
+
+
+```{r plot sample distribution by cell types}
+meta           <- q.b@meta.data
+meta$cluster   <- q.b@meta.data$b.cell.types
+order_cluster  <- c('Bnaive-1', 'Bnaive-2', 'Bmemory', 'plasmablast') 
+meta$cluster   <- factor(meta$cluster, levels = order_cluster)
+
+# total cells for each cell types
+p.mc.1 <- plotbar.total.cells(meta)
+
+# total cells for each sample
+p.mc.2 <- plotbar.total.samples(meta) 
+         
+# proport of cells for each sample
+p.mc.3 <- plotbar.sample.cell(meta) + theme(text=element_text(size=12))
+ 
+
+# No. gene for each cell type
+p.mc.4 <- plotbar.sample.gene(meta)  + theme(text=element_text(size=12))
+
+eoffice::topptx(p.mc.4 , filename = outfile, append = T, width = 8, height = 3, title = paste0(' NO. genes (cell types) '))
+eoffice::topptx(p.mc.3 , filename = outfile, append = T, width = 8, height = 3, title = paste0(' % cells of  cell types (cell types) '))
+eoffice::topptx(p.mc.1 + p.mc.2 , filename = outfile, append = T, width = 8, height = 3, title = paste0(' No. cells  (cell types)'))
+#eoffice::topptx(p.mc.3 , filename = outfile, append = T, width = 12, height = 2, title = paste0(' % cells of cell types free_y'))
+```
+
+
+```{r plot sample distribution by cell types}
+ggsave(p.mc.3, filename =  'q.b.rmDobulets/bar.celltype.pct.pdf', w = 8, h = 3)
+```
+
+
+```{r plot isotype sample distribution by cell types}
+
+# VDJ detect proportion
+ggplot(meta %>% mutate(VDJ_paired_detected = if_else(grepl('IGH',isotype), 'True', 'FALSE' )), 
+       aes(x = HTO_classification, fill = VDJ_paired_detected)) +
+    geom_bar(position = position_fill(), width = 0.7) +
+    facet_wrap(~ cluster, nrow = 1) + 
+    # geom_text(aes(label = p2, y=p), position = "stack") +
+    theme_pubclean() + 
+    theme(text=element_text(size=12)) +
+    scale_fill_manual(values = color_tf) +
+    ylab('% of cells') +
+    rremove('legend') + rremove('xlab')
+eoffice::topptx(last_plot() , filename = outfile, append = T, width = 8, height = 2, title = paste0(' % cells of  cell types (VDJ_paired) '))
+
+
+# with number labels
+ggplot(meta %>% mutate(VDJ_paired_detected = if_else(grepl('IGH',isotype), 'True', 'FALSE' )) %>% 
+           group_by(VDJ_paired_detected, HTO_classification, cluster) %>% summarise(N_cells = n()) %>% 
+           ungroup() %>% group_by(HTO_classification, cluster) %>% mutate(p = N_cells/sum(N_cells) ), 
+       aes(x = HTO_classification, N_cells, fill = VDJ_paired_detected)) +
+    geom_bar( stat="identity",position = "fill", width = 0.7) +
+    geom_text(aes(label = N_cells, y = p), position = position_fill(vjust = 0.95), size = 3, color = 'white') +
+    facet_wrap(~ cluster, nrow = 1) + 
+    #scale_y_continuous(labels=percent) +
+    theme_pubclean() + 
+    theme(text=element_text(size=12)) +
+    scale_fill_manual(values = color_tf) +
+    ylab('% of cells') +
+    rremove('legend') + rremove('xlab')
+eoffice::topptx(last_plot() , filename = outfile, append = T, width = 8, height = 2, title = paste0(' % cells of  cell types (VDJ_paired) '))
+
+# isotype distribution
+ggplot(meta %>% filter(grepl('IGH',isotype)), 
+       aes(x = HTO_classification, fill = isotype)) +
+    geom_bar(position = position_fill(), width = 0.7) +
+    facet_wrap(~ cluster, nrow = 1) + 
+    # theme_pubclean(text=element_text(size=20)) + 
+    scale_fill_manual(values = col_isotype) +
+    ylab('% of cells') +
+    rremove('legend') + rremove('xlab')
+
+eoffice::topptx(last_plot() , filename = outfile, append = T, width = 8, height = 2, title = paste0(' % cells of  cell types (isotype) '))
+
+
+# 
+df_memory_isotype = meta %>% filter(grepl('IGH',isotype), b.cell.types == 'Bmemory') %>% group_by(HTO_classification, isotype) %>% summarise(N_cells = n()) %>% 
+  spread(HTO_classification, N_cells, fill = 0)
+write_tsv(df_memory_isotype, 'q.b.rmDobulets/isotype.Bmemory.cellnumber.tsv')
+```
+
+
+
+```{r plot SHM}
+# isotype distribution
+ggplot(meta %>% filter(!is.na(isotype)) %>% filter(cluster %in% c('Bmemory', 'Bnaive')), 
+       aes(x = HTO_classification, y = SHM_VH, fill = HTO_classification)) +
+    #geom_violin(scale = 'width') +
+    #geom_point() +
+    geom_boxplot(width = 0.6, outlier.shape = NA) +
+    facet_wrap(~ cluster, nrow = 1) + 
+    theme_pubclean() + 
+    scale_fill_manual(values = color_sample) +
+    ylab('SHM frequencies') +
+    rremove('legend') + rremove('xlab')
+
+eoffice::topptx(last_plot() , filename = outfile, append = T, width = 4, height = 2, title = paste0(' % cells of  cell types (v_shm) '))
+
+
+# isotype in Bmemory, seperated by Swithed and unswitched
+ggplot(meta %>% filter(!is.na(isotype)) %>% filter(cluster %in% c('Bmemory')) %>% 
+         mutate(Isotype2 = if_else(isotype %in% c('IGHM', 'IGHD'), 'Unswitched', 'Switched')), 
+       aes(x = HTO_classification, y = SHM_VH, fill = Isotype2)) +
+    #geom_violin(scale = 'width') +
+    #geom_point() +
+    geom_boxplot(width = 0.6, outlier.shape = NA) +
+    #facet_wrap(~ cluster, nrow = 1) + 
+    theme_pubclean() + 
+    #scale_fill_manual(values = color_sample) +
+    ylab('SHM frequencies') +
+   # rremove('legend') +
+   rremove('xlab')
+
+eoffice::topptx(last_plot() , filename = outfile, append = T, width = 4, height = 2, title = paste0(' % cells of  cell types (v_shm) '))
+
+```
+
+```{r cell number table}
+stat_bcell = meta %>% group_by(HTO_classification, cluster) %>% summarise(N_cells = n()) %>% spread(HTO_classification, N_cells)
+
+stat_VDJcell = meta %>% filter(is.na(barcode)) %>% 
+    group_by(HTO_classification, cluster) %>% summarise(N_cells = n()) %>% spread(HTO_classification, N_cells)
+
+stat_bcell
+
+write_tsv(stat_bcell, 'q.b.rmDobulets/cells_number.groups.tsv')
+
+```
+
+
+## Clonotype statisical
+paired scVDJ number is too little to do clonotype statisical
+```{r}
+combined.cluster <- expression2List(q.b, split.by = "b.cell.types")
+combined.sample <- expression2List(q.b, split.by = "HTO_classification")
+q.b$bcell_sample <- str_c(q.b$b.cell.types, q.b$HTO_classification, sep = ':')
+combined2 <- expression2List(q.b, split.by = "bcell_sample")
+
+#combined2.naive <- subsetContig(combined2, name = "HTO_classification", variables = c("Bnaive"))
+
+# diversity
+tt = clonalDiversity(combined2, cloneCall = "aa",  n.boots = 100,  exportTable = T)
+
+
+# unique clontype
+tt = quantContig(combined2, cloneCall="nt",  
+            exportTable = T,
+            #chain = 'IGH', 
+            #split.by = 'b.cell.types'
+            scale = T)
+
+# alluviaClontypes
+alluvialClonotypes(q.b, cloneCall = "gene", 
+                   y.axes = c("orig.ident",  "HTO_classification", "b.cell.types"), 
+                   color = "HTO_classification") 
+
+```
+
+
+```{r memrory switched }
+
+# subset seurat failed
+# Idents(q.b)   <- 'b.cell.types'
+# q.b.mem = subset(q.b, idents = c('Bmemory'))
+# q.b.mem = subset(q.b, subset = b.cell.types %in% factor('Bmemory'))
+# 
+# Idents(q.b.mem)   <- 'isotype'
+# q.b.mem.switched = subset(q.b.mem, idents = c('IGHM', "IGHD"), invert = T)
+
+
+bcr.mem.swithced = meta %>% filter(b.cell.types == 'Bmemory', isotype %in% c('IGHA1', 'IGHA2', "IGHG1", 'IGHG2', 'IGHG3', 'IGHG4')) %>% 
+    group_split(HTO_classification, .keep = T)
+names(bcr.mem.swithced) <- order_sample
+
+quantContig(bcr.mem.swithced, cloneCall="nt", scale = T, chain = 'IGH')
+lengthContig(bcr.mem.swithced, cloneCall="aa", chain = "both") 
+
+```
+
+
+
+
+
+
+```{r IGHV gene usage: scRNAseq}
+Idents(q.b)   <- q.b$HTO_classification
+
+mat_ave_cluster <- AverageExpression(q.b, return.seurat = T)@assays$RNA@data
+genes <- rownames(mat_ave_cluster)[grepl('^IGHV', rownames(mat_ave_cluster)) & rowSums(mat_ave_cluster) != 0 ]
+mat_cluster     <- mat_ave_cluster[genes,]
+
+myheatmap(mat_cluster)
+heat <- myheatmap(mat_ave_cluster[unique(genes), ])  # affected by cluster size
+
+pdf(file = 'q.b.rmDobulets/heatmap.IGHV.group.pdf', h = 7, w = 5)
+myheatmap(mat_cluster) 
+#add.flag(heat, kept.labels = top5$gene,  repel.degree = 0.2)
+dev.off()
+
+topptx(myheatmap(mat_cluster) , filename = outfile, append = T, width = 5, height = 6, title = 'IGHV genes for each group ')
+
+```
+
+
+
+```{r IGHV gene usage: scRNAseq : B memory}
+Idents(q.b)   <- q.b$HTO_classification
+
+mat_ave_cluster <- AverageExpression(subset(q.b,b.cell.types %in% factor('Bmemory')), return.seurat = T)@assays$RNA@data
+genes <- rownames(mat_ave_cluster)[grepl('^IGHV', rownames(mat_ave_cluster)) & rowSums(mat_ave_cluster) != 0 ]
+mat_cluster     <- mat_ave_cluster[genes,]
+
+myheatmap(mat_cluster)
+heat <- myheatmap(mat_ave_cluster[unique(genes), ])  # affected by cluster size
+
+pdf(file = 'q.b.rmDobulets/heatmap.IGHV.Bmem.pdf', h = 7, w = 5)
+myheatmap(mat_cluster) 
+#add.flag(heat, kept.labels = top5$gene,  repel.degree = 0.2)
+dev.off()
+
+topptx(myheatmap(mat_cluster) , filename = outfile, append = T, width = 5, height = 6, title = 'IGHV genes for each group (Bmemory) ')
+
+```
+
+
+
+```{r IGHV genes usage: scVDJ}
+
+df.v = vizGenes(combined.sample, gene = "V", chain = "IGH", plot = "heatmap", order = "gene", scale = T, exportTable = T)
+
+# statistic of infected and only vaccinated
+tt = df.v %>% select(Var1, Var2) %>% mutate(n = 1) %>% spread(Var2, n, fill = 0) %>%  mutate(Infected = `Cso-hb` + `AZ-hb` + `Inf`, Vacc = Cso + AZ)
+
+col.v  = structure(scales::alpha(paletteer::paletteer_c("grDevices::rainbow", length(unique(df.v$Var1))), alpha = .7), names = unique(df.v$Var1))
+
+mydonut <- function(group, mydf) {
+  tt = mydf %>% filter(Var2 == group) %>% mutate(n = n*100) %>% ungroup() %>% arrange(-n) 
+  tt$Var1 = factor(tt$Var1, levels = tt$Var1)
+  tt = tt %>% mutate(top5 = if_else(Var1 %in% head(tt$Var1,5), as.character(Var1), ""))
+
+
+  ggdonutchart( tt,
+                x = 'n',   label = "top5", 
+                     lab.pos = 'in', lab.font = 4, 
+             fill = "Var1",  color = "white", palette = col.v) + 
+    annotate(geom = 'text', x = 0.5, y = 0, label = paste0(group,'\n', tt$sum[1] )) + 
+    rremove('legend')
+}
+
+
+p_list = map( c( "AZ", "AZ-hb", 'Cso', 'Cso-hb', "Inf"), mydonut, mydf = df.v)
+
+topptx(plot_grid(plotlist = p_list, nrow = 1), filename = outfile, append = T, width = 10, height = 2, title = 'IGHV genes for each group ')
+
+```
+
+
+
+```{r IGHV genes usage: scVDJ-B memory}
+
+df.v = vizGenes(combined2, gene = "V", chain = "IGH", plot = "heatmap", order = "gene", scale = T, exportTable = T) %>% 
+  filter(grepl('^Bmem', Var2)) %>% 
+  mutate(Var2 = str_remove(Var2, 'Bmemory:'))
+
+
+p_list = map( c( "AZ", "AZ-hb",'Cso', 'Cso-hb', "Inf"), mydonut, mydf = df.v)
+
+topptx(plot_grid(plotlist = p_list, nrow = 1), filename = outfile, append = T, width = 8, height = 2, title = 'IGHV genes for each group (B memory) ')
+
+```
+
+
+```{r IGHV+J genes usage}
+ 
+group.vj = expand.grid(IGHV = unique(str_remove_all(q.b@meta.data$CTgene, '\\..*')) , IGHJ = str_c('IGHJ',seq(1:6) ), HTO_classification = order_sample) %>% 
+  filter(!is.na(IGHV))
+
+df.vj = q.b@meta.data %>% 
+  filter(b.cell.types == 'Bmemory') %>% 
+  dplyr::select(HTO_classification, CTgene, CTaa) %>% 
+  mutate(IGHV = str_extract(CTgene, 'IGHV\\d-\\d+\\w?'),
+         IGHJ = str_extract(CTgene, 'IGHJ\\d+')) %>% 
+  filter(!is.na(IGHV), !is.na(IGHJ)) %>% 
+  group_by(IGHV, IGHJ, HTO_classification) %>% 
+  summarise(n = n()) %>% 
+  ungroup() %>% group_by(HTO_classification) %>% 
+  mutate(total = sum(n),
+         pct = n/ total *100) %>% 
+  ungroup() %>%  
+  dplyr::select(IGHV,IGHJ,pct, HTO_classification) %>% 
+  right_join(group.vj) %>%  # supply all IGHV IGHJ group combinations
+  mutate(IGHJ = str_c( IGHJ, HTO_classification, sep = ':')) %>%
+  dplyr::select(-HTO_classification) %>%   
+  spread(IGHV, pct, fill = 0) %>% gather(IGHV, pct, -IGHJ) %>% 
+  spread(IGHJ, pct,fill = 0)  
+  
+# split by IGHJ
+anntate_col = data.frame(group= str_remove_all(names(df.vj)[-1], ':.*'))
+rownames(anntate_col) = str_c(names(df.vj)[-1])
+
+# split by group
+# anntate_col = data.frame(group= str_remove_all(names(df.vj)[-1], '.*:'))
+# rownames(anntate_col) = str_c(names(df.vj)[-1])
+
+
+ph_vj <- ComplexHeatmap::pheatmap(df.vj%>% distinct() %>% column_to_rownames('IGHV')  ,
+                         cluster_rows = F, cluster_cols = F, 
+                         na_col = 'white', color = brewer.pal(10, 'Purples'), 
+                         breaks = seq(0,15),
+                         legend = T, show_rownames = T,
+                         #annotation_row =  anntate_row$Months,
+                         column_split = anntate_col$group)
+ph_vj
+
+#ggsave(ggplotify::as.grob( ph_vj) ,filename = outfile, append = T, width = 8, height = 4)
+topptx( ph_vj ,filename = outfile, append = T, width = 8, height = 6, title = 'IGHV-IGHJ genes for each group (B memory) ')
+```
+
+
+
+```{r VH+VL V genes usage}
+ 
+group.vh_vl = expand.grid(VH = unique(str_extract(q.b@meta.data$CTgene, 'IGHV\\d-\\d+\\w?')) , 
+                          VL = unique(str_extract(q.b@meta.data$CTgene, 'IG[KL]V\\d-\\d+\\w?')),
+                          HTO_classification = order_sample) %>% 
+  filter(!is.na(VH))
+
+df.vh_vl = q.b@meta.data %>% 
+  # filter(b.cell.types == 'Bmemory') %>% 
+  dplyr::select(HTO_classification, CTgene) %>% 
+  mutate(VH = str_extract(CTgene, 'IGHV\\d-\\d+\\w?'),
+         VL = str_extract(CTgene, 'IG[KL]V\\d-\\d+\\w?')) %>% 
+  filter(!is.na(VH), !is.na(VL)) %>% 
+  group_by(VH, VL, HTO_classification) %>% 
+  summarise(n = n()) %>% 
+  ungroup() %>% group_by(HTO_classification) %>% 
+  mutate(total = sum(n),
+         pct = n/ total *100) %>% 
+  ungroup() 
+write_tsv(df.vh_vl, 'q.b.rmDobulets/IGHV-IGKLV.allB.tsv') 
+ 
+
+```
+
+
+```{r CDR3aa}
+df.cdr3 = q.b@meta.data %>% 
+  #filter(b.cell.types == 'Bmemory') %>% 
+  dplyr::select(HTO_classification, CTgene, CTaa) %>%
+    mutate(CDRH3 = str_remove(str_remove(str_remove(CTaa, '_.*'), '^C'), '[FW]$'),
+         CDRL3 =  str_remove(CTaa, '.*_')) 
+
+# same VH-VJ + LH-LJ
+df.cdr3 %>% filter(!is.na(CTgene)) %>% group_by(CTgene) %>% summarise(N_group  = length(unique(HTO_classification))) %>% arrange(-N_group)
+df.cdr3 %>% filter(CTgene == 'IGHV3-33..IGHJ4.IGHG2_IGKV3-15.IGKJ4.IGKC') #2
+
+# same CDRH3
+df.cdr3 %>% filter(!is.na(CTgene)) %>% group_by(CDRH3) %>% summarise(N_group  = length(unique(HTO_classification))) %>% arrange(-N_group) # all are 1
+
+# similare CDRH3 to Database
+seqinr::write.fasta(sequences = as.list( toupper(df.cdr3$CDRH3)), 
+            names = str_c(df.cdr3$HTO_classification, df.cdr3$CTgene, sep = '|'), 
+            file.out = 'results/B.CDRH3pep.fa')
+            #file.out = 'results/Bmem.CDRH3pep.fa')
+
+ 
+
+# bash
+# conda activate wgs
+# cd-hit-2d -i2  Bmemory.CDRH3pep.fa -i CoVAbDab_200422.cdr3pep.fa -c 0.8 -d 0 -S 0 -o Bmem_DB  -l 5
+
+library(bioformatr)
+#df_cdhit2 = read.cdhit.clstr('results/Bmem_DB.clstr') %>% 
+df_cdhit2 = read.cdhit.clstr('results/cdhit.B.80.clstr') %>%
+  filter(Seq.Num > 0) %>% 
+  mutate(Identity =  if_else(is.na(Identity), Identity.1, Identity)) %>% 
+  dplyr::select(-starts_with('E.Value'), -starts_with('Aln'), -Identity.1) %>% 
+  mutate(Seq.Num = as.numeric(Seq.Num))
+
+
+# similar CDRH3 among group
+# bash
+# conda activate wgs
+# cd-hit -i Bmemory.CDRH3pep.fa  -o cdhit.Bmem.80 -c 0.8 -T 12 -l 5 -sc 1 -S 0  -d 0 
+# cd-hit -i B.CDRH3pep.fa -o cdhit.B.80 -T 12 -l 5 -sc 1 -S 0  -d 0
+df_cdhit = read.cdhit.clstr('results/cdhit.Bmem.80.clstr')  %>% filter(Seq.Num > 0) 
+
+
+```
+```{r save }
+saveRDS(q.b, 'results/08_B.removeDoublets.annot.rds')
+```
+
+

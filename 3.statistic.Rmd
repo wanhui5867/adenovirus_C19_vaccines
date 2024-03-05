@@ -1,0 +1,471 @@
+---
+title: "3.statistic"
+author: "hui.wan"
+date: "3/10/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+This script is to do statistic on the cell proprotion of each cell subtype among groups.
+
+```{r}
+library(readxl)
+library(openxlsx)
+library(tidyverse)
+library(rstatix)
+```
+
+ 
+```{r read_data}
+sf.all = read_tsv('results/CellType.stat.xls') 
+sf.b = read_tsv('q.b.rmDobulets/cells_number.groups.tsv') 
+sf.t = read_tsv('q.t.cells/cells_number.groups.tsv')
+
+wb.pct <- createWorkbook()
+wb.p <- createWorkbook()
+wb.psig <- createWorkbook()
+```
+ 
+ 
+ # chiseq pecent
+```{r chiseq}
+st.all = sf.all %>% select(major.cell.types = Var1, group = Var2, n_cell = Freq, total_cell = total_cells ) %>% mutate(rest_cell = total_cell -n_cell)
+
+my.chiseq.all <- function(celltype){
+
+ st.all %>% filter(major.cell.types == celltype) %>% select(group, n_cell, rest_cell) %>% column_to_rownames('group') %>% t() %>% as.table() %>% pairwise_prop_test(.) %>% mutate(Cell_type = celltype)
+
+}
+
+st.all.p = map_df(unique(st.all$major.cell.types), my.chiseq.all) %>% add_significance( 'p') %>% 
+  filter(! (group1 == 'AZ' & group2 == 'Cso-hb') , ! (group1 == 'AZ-hb' & group2 == 'Cso') ) %>% 
+  left_join(st.all %>% transmute(Cell_type = major.cell.types, group1 = group, value1 = n_cell/total_cell * 100 ) ) %>% 
+    left_join(st.all %>% transmute(Cell_type = major.cell.types,group2 = group, value2 = n_cell/total_cell * 100 ) ) 
+
+addWorksheet(wb.p, sheetName = 'major_cell_type')
+writeDataTable(wb.p,  1, as.data.frame(st.all.p) )
+
+st.all.p.reshap = st.all.p %>% mutate(Comparsion = str_c(group1, ' vs ' , group2)) %>% 
+  select( Comparsion, p.signif, Cell_type) %>% spread(Comparsion, p.signif)
+addWorksheet(wb.psig, sheetName = 'major_cell_type')
+
+writeDataTable(wb.psig,  1, as.data.frame(st.all.p.reshap) )
+
+# write.xlsx(as.data.frame(st.all.p.reshap), 'pvalue.groupComparsion.xlsx', sheetName = 'major_cell_type', overwrite = F ,row.names = F, col.names = T )
+```
+
+
+
+```{r Bcells}
+
+st.b = sf.b %>% gather(group, n_cell, -b.cell.types)  %>% 
+  group_by(group) %>% mutate(total_cell = sum(n_cell)) %>% mutate(rest_cell = total_cell - n_cell) %>% 
+  ungroup()
+
+my.chiseq.b <- function(celltype){
+  # mydf = st.b
+  # celltype = 'Bnaive'
+  
+ st.b %>% filter(b.cell.types == celltype) %>% select(group, n_cell, rest_cell) %>% column_to_rownames('group') %>% t() %>% as.table() %>% pairwise_prop_test(.) %>% mutate(Cell_type = celltype)
+
+}
+
+st.b.p = map_df(sf.b$b.cell.types,my.chiseq.b) %>% add_significance( 'p') %>% 
+  filter(! (group1 == 'AZ' & group2 == 'Cso-hb') , ! (group1 == 'AZ-hb' & group2 == 'Cso') ) %>% 
+    left_join(st.b %>% transmute(Cell_type = b.cell.types, group1 = group, value1 = n_cell/total_cell * 100 ) ) %>% 
+    left_join(st.b %>% transmute(Cell_type = b.cell.types, group2 = group, value2 = n_cell/total_cell * 100 ) ) 
+
+
+addWorksheet(wb.p, sheetName = 'B_cell_type')
+writeDataTable(wb.p,  2, as.data.frame(st.b.p) )
+# write.xlsx(as.data.frame(st.b.p), 'pvalue.cellcomposition.xlsx', sheetName = 'B_cell_type', append = T, row.names = F, col.names = T )
+
+
+st.b.p.shap = st.b.p %>% mutate(Comparsion = str_c(group1, ' vs ' , group2)) %>% 
+  select( Comparsion, p.signif, Cell_type) %>% spread(Comparsion, p.signif)
+
+addWorksheet(wb.psig, sheetName = 'B_cell_type')
+writeDataTable(wb.psig,  2, as.data.frame(st.b.p.shap) )
+
+# write.xlsx(as.data.frame(st.b.p.shap), 'pvalue.groupComparsion.xlsx', sheetName = 'B_cell_type', append = T, row.names = F, col.names = T )
+
+```
+
+
+
+
+
+### t cells
+```{r Tcells}
+
+st.t = sf.t %>% gather(group, n_cell, -t.cell.types)  %>% 
+  group_by(group) %>% mutate(total_cell = sum(n_cell)) %>% mutate(rest_cell = total_cell - n_cell) %>% 
+  ungroup()
+
+my.chiseq.t <- function(celltype){
+  # mydf = st.b
+  # celltype = 'Bnaive'
+  
+ st.t %>% filter(t.cell.types == celltype) %>% select(group, n_cell, rest_cell) %>% column_to_rownames('group') %>% t() %>% as.table() %>% pairwise_prop_test(.) %>% mutate(Cell_type = celltype)
+
+}
+
+st.t.p = map_df(sf.t$t.cell.types,my.chiseq.t) %>% add_significance( 'p') %>% 
+  filter(! (group1 == 'AZ' & group2 == 'Cso-hb') , ! (group1 == 'AZ-hb' & group2 == 'Cso') ) %>% 
+    left_join(st.t %>% transmute(Cell_type = t.cell.types, group1 = group, value1 = n_cell/total_cell * 100 ) ) %>% 
+    left_join(st.t %>% transmute(Cell_type = t.cell.types, group2 = group, value2 = n_cell/total_cell * 100 ) ) 
+
+addWorksheet(wb.p, sheetName = 'T_cell_type')
+writeDataTable(wb.p,  3, as.data.frame(st.t.p) )
+
+# write.xlsx(as.data.frame(st.t.p), 'pvalue.cellcomposition.xlsx', sheetName = 'T_cell_type', append = T, row.names = F, col.names = T )
+
+
+st.t.p.shap = st.t.p %>% mutate(Comparsion = str_c(group1, ' vs ' , group2)) %>% 
+  select( Comparsion, p.signif, Cell_type) %>% spread(Comparsion, p.signif)
+
+addWorksheet(wb.psig, sheetName = 'T_cell_type')
+writeDataTable(wb.psig,  3, as.data.frame(st.t.p.shap) )
+
+# write.xlsx(as.data.frame(st.t.p.shap), 'pvalue.groupComparsion.xlsx', sheetName = 'T_cell_type', append = T, row.names = F, col.names = T )
+
+```
+
+
+```{r T major}
+
+st.t.m = sf.t %>%  filter(t.cell.types  != '???? T') %>%
+  mutate(t.cell.types = str_remove_all(t.cell.types , '\\..*')) %>%
+  gather(group, n_cell, -t.cell.types)  %>% 
+  group_by(group, t.cell.types) %>% summarise(n_cell = sum(n_cell)) %>% ungroup() %>% 
+  group_by(group) %>% mutate(total_cell = sum(n_cell)) %>% mutate(rest_cell = total_cell - n_cell) %>% 
+  ungroup()
+
+my.chiseq.t.m <- function(celltype){
+  # mydf = st.b
+  # celltype = 'Bnaive'
+  
+ st.t.m %>% filter(t.cell.types == celltype) %>% select(group, n_cell, rest_cell) %>% column_to_rownames('group') %>% t() %>% as.table() %>% pairwise_prop_test(.) %>% mutate(Cell_type = celltype)
+
+}
+
+st.t.m.p = map_df(unique(st.t.m$t.cell.types),my.chiseq.t.m) %>% add_significance( 'p') %>% 
+  filter(! (group1 == 'AZ' & group2 == 'Cso-hb') , ! (group1 == 'AZ-hb' & group2 == 'Cso') ) %>% 
+    left_join(st.t.m %>% transmute(Cell_type = t.cell.types, group1 = group, value1 = n_cell/total_cell * 100 ) ) %>% 
+    left_join(st.t.m %>% transmute(Cell_type = t.cell.types, group2 = group, value2 = n_cell/total_cell * 100 ) ) 
+
+addWorksheet(wb.p, sheetName = 'T_major_cell_type')
+writeDataTable(wb.p,  4, as.data.frame(st.t.m.p) )
+
+# write.xlsx(as.data.frame(st.t.m.p), 'pvalue.cellcomposition.xlsx', sheetName = 'T_major_cell_type', append = T, row.names = F, col.names = T )
+
+
+st.t.m.p.shap = st.t.m.p %>% mutate(Comparsion = str_c(group1, ' vs ' , group2)) %>% 
+  select( Comparsion, p.signif, Cell_type) %>% spread(Comparsion, p.signif)
+
+
+addWorksheet(wb.psig, sheetName = 'T_major_cell_type')
+writeDataTable(wb.psig,  4, as.data.frame(st.t.m.p.shap) )
+
+# write.xlsx(as.data.frame(st.t.m.p.shap), 'pvalue.groupComparsion.xlsx', sheetName = 'T_major_cell_type', append = T, row.names = F, col.names = T )
+
+```
+
+
+
+## BCR
+
+```{r Isotype}
+
+meta           <- q.b@meta.data
+meta$cluster   <- q.b@meta.data$b.cell.types
+
+
+# Isotype
+bcr.isotype = meta %>% filter(grepl('IGH',isotype), cluster %in% c('Bmemory')) %>% 
+  group_by(isotype, HTO_classification) %>% summarise(n_cell = n()) %>% 
+  spread(HTO_classification, n_cell, fill = 0)
+
+
+st.c = bcr.isotype %>% gather(group, n_cell, -isotype)  %>%  
+  group_by(group) %>% mutate(total_cell = sum(n_cell)) %>% mutate(rest_cell = total_cell - n_cell) %>% 
+  ungroup()
+
+my.chiseq.c <- function(C){
+  # mydf = st.b
+  # celltype = 'Bnaive'
+  
+ st.c %>% filter(isotype == C) %>% select(group, n_cell, rest_cell) %>% column_to_rownames('group') %>% t() %>% as.table() %>% pairwise_prop_test(.) %>% mutate(Isotype = C)
+
+}
+
+st.c.p = map_df(unique(st.c$isotype), my.chiseq.c) %>% add_significance( 'p') %>% 
+  filter(! (group1 == 'AZ' & group2 == 'Cso-hb') , ! (group1 == 'AZ-hb' & group2 == 'Cso') ) %>% 
+    left_join(st.c %>% transmute(Isotype = isotype, group1 = group, value1 = n_cell/total_cell * 100 ) ) %>% 
+    left_join(st.c %>% transmute(Isotype = isotype, group2 = group, value2 = n_cell/total_cell * 100 ) ) 
+
+addWorksheet(wb.p, sheetName = 'Isotype_Bmemory')
+writeDataTable(wb.p,  5, as.data.frame(st.c.p) )
+
+# write.xlsx(as.data.frame(st.c.p), 'pvalue.cellcomposition.xlsx', sheetName = 'Isotype_Bmemory', append = T, row.names = F, col.names = T )
+
+
+st.c.p.shap = st.c.p %>% mutate(Comparsion = str_c(group1, ' vs ' , group2)) %>% 
+  select( Comparsion, p.signif, Isotype) %>% distinct() %>%  spread(Comparsion, p.signif)
+
+addWorksheet(wb.psig, sheetName = 'Isotype_Bmemory')
+writeDataTable(wb.psig, 5, as.data.frame(st.c.p.shap) )
+
+# write.xlsx(as.data.frame(st.c.p.shap), 'pvalue.groupComparsion.xlsx', sheetName = 'Isotype_Bmemory', append = T, row.names = F, col.names = T )
+```      
+
+
+
+# SHM
+```{r SHM }
+# SHM
+bcr.shm = meta %>% filter(!is.na(isotype)) %>% filter(cluster %in% c('Bmemory')) %>% 
+         mutate(Isotype2 = if_else(isotype %in% c('IGHM', 'IGHD'), 'Unswitched', 'Switched')) %>% 
+  select(group = HTO_classification, Isotype2,SHM_VH) %>% ungroup()
+
+stat.shm = bcr.shm %>% group_by(Isotype2, group)  %>%  summarise(SHM_VH_median = median(SHM_VH))
+
+stat.shm.p = bcr.shm %>% group_by(Isotype2) %>% wilcox_test( SHM_VH ~ group )  %>%  add_significance( 'p') %>% 
+    filter(! (group1 == 'AZ' & group2 == 'Cso-hb') , ! (group1 == 'AZ-hb' & group2 == 'Cso') ) %>% 
+    left_join(stat.shm %>% transmute(Isotype2, group1 = group, value1 = SHM_VH_median ) ) %>% 
+    left_join(stat.shm %>% transmute(Isotype2, group2 = group, value2 = SHM_VH_median ) ) 
+
+addWorksheet(wb.p, sheetName = 'SHM_VH')
+writeDataTable(wb.p,  6, as.data.frame(stat.shm.p) )
+
+# write.xlsx(as.data.frame(stat.shm.p), 'pvalue.cellcomposition.xlsx', sheetName = 'SHM_VH', append = T, row.names = F, col.names = T )
+
+
+stat.shm.p.shap = stat.shm.p %>% mutate(Comparsion = str_c(group1, ' vs ' , group2)) %>% 
+  select( Comparsion, p.signif, Isotype2) %>% distinct() %>%  spread(Comparsion, p.signif)
+
+addWorksheet(wb.psig, sheetName = 'SHM_VH')
+writeDataTable(wb.psig, 6, as.data.frame(stat.shm.p.shap) )
+
+# write.xlsx(as.data.frame(stat.shm.p.shap), 'pvalue.groupComparsion.xlsx', sheetName = 'SHM_VH', append = T, row.names = F, col.names = T )
+```
+
+
+## IGHV
+```{r IGHV}
+df.v = vizGenes(combined.sample, gene = "V", chain = "IGH", plot = "heatmap", order = "gene", scale = T, exportTable = T) %>% ungroup()
+write_tsv(df.v, 'q.b.rmDobulets//IGHV.freq.tsv') 
+
+# Isotype
+st.v =df.v %>% ungroup() %>% 
+  transmute(IGHV = Var1, group = Var2, 
+            n_cell = round(n*sum,0)) %>% 
+  tidyr::complete(IGHV, group, fill = list(n_cell = 0 )) %>% 
+  left_join(df.v %>% ungroup() %>% select(group = Var2, total_cell = sum) %>% distinct()) %>% 
+  mutate(rest_cell = total_cell - n_cell )  
+
+
+
+
+my.chiseq.V <- function(V){
+  # mydf = st.b
+  # celltype = 'Bnaive'
+  
+ st.v %>% filter(IGHV == V) %>% select(group, n_cell, rest_cell) %>% column_to_rownames('group') %>% t() %>% as.table() %>% pairwise_prop_test(.) %>% mutate(IGHV = V)
+
+}
+
+st.v.p = map_df(unique(st.v$IGHV), my.chiseq.V) %>% add_significance( 'p') %>% 
+  filter(! (group1 == 'AZ' & group2 == 'Cso-hb') , ! (group1 == 'AZ-hb' & group2 == 'Cso') ) %>% 
+    left_join(df.v %>% transmute(IGHV = Var1, group1 = Var2, value1 = n ) ) %>% 
+    left_join(df.v %>% transmute(IGHV = Var1, group2 = Var2, value2 = n ) ) 
+
+addWorksheet(wb.p, sheetName = 'IGHV_pct')
+writeDataTable(wb.p,  7, as.data.frame(st.v.p) )
+
+# write.xlsx(as.data.frame(st.v.p), 'pvalue.cellcomposition.xlsx', sheetName = 'IGHV_pct', append = T, row.names = F, col.names = T )
+
+
+st.v.p.shap = st.v.p %>% mutate(Comparsion = str_c(group1, ' vs ' , group2)) %>% 
+  select( Comparsion, p.signif, IGHV) %>% distinct() %>%  spread(Comparsion, p.signif)
+
+addWorksheet(wb.psig, sheetName = 'IGHV_p')
+writeDataTable(wb.psig, 7, as.data.frame(st.v.p.shap) )
+
+# write.xlsx(as.data.frame(st.v.p.shap), 'pvalue.groupComparsion.xlsx', sheetName = 'IGHV_p', append = T, row.names = F, col.names = T )
+
+```
+
+
+## IGHV-J
+```{r IGHV-J}
+group.vj = expand.grid(IGHV = unique(str_remove_all(q.b@meta.data$CTgene, '\\..*')) , IGHJ = str_c('IGHJ',seq(1:6) ), HTO_classification = order_sample) %>% 
+  filter(!is.na(IGHV))
+
+df.vj = q.b@meta.data %>% 
+  filter(b.cell.types == 'Bmemory') %>% 
+  dplyr::select(HTO_classification, CTgene, CTaa) %>% 
+  mutate(IGHV = str_extract(CTgene, 'IGHV\\d-\\d+\\w?'),
+         IGHJ = str_extract(CTgene, 'IGHJ\\d+')) %>% 
+  filter(!is.na(IGHV), !is.na(IGHJ)) %>% 
+  group_by(IGHV, IGHJ, HTO_classification) %>% 
+  summarise(n = n()) %>% 
+  ungroup() %>% group_by(HTO_classification) %>% 
+  mutate(total = sum(n),
+         pct = n/ total *100) %>% 
+  ungroup() %>%  
+  dplyr::select(IGHV,IGHJ,n,total, HTO_classification) %>% 
+  right_join(group.vj) %>%  # supply all IGHV IGHJ group combinations
+  mutate(IGHV_J = str_c( IGHV, IGHJ, sep = ':')) %>% 
+  dplyr::select(-IGHV, -IGHJ) %>% 
+  ungroup()
+
+
+write_tsv(df.vj %>% select(-total) %>%  spread(HTO_classification, n), 'q.b.cells/IGHV-J.Bmemory.freq.tsv')
+
+# filter out IGHV_J with all groups are  0 
+VJ_0 = df.vj %>% group_by(IGHV_J) %>% dplyr::summarise(n = sum(n, na.rm = T)) %>% ungroup() %>% filter(n == 0) %>% pull(IGHV_J)
+
+# Isotype
+st.vj =df.vj %>% ungroup() %>% filter(!IGHV_J %in% VJ_0) %>% 
+  transmute(IGHV_J, group = HTO_classification, 
+            n_cell = n, total_cell = total) %>% 
+  tidyr::complete(IGHV_J, group, fill = list(n_cell = 0, total_cell = 0 )) %>% 
+  mutate(rest_cell = total_cell - n_cell )   %>% 
+  filter( total_cell != 0 )
+
+# filter out IGHVJ only in one group
+VJ_1 = st.vj %>% group_by(IGHV_J) %>% dplyr::summarise(n = n()) %>% ungroup() %>% filter(n >1) %>% pull(IGHV_J)
+st.vj = st.vj %>% filter(IGHV_J %in% VJ_1)
+
+
+
+my.chiseq.VJ <- function(VJ){
+  # mydf = st.b
+  # celltype = 'Bnaive'
+  
+ st.vj %>% filter(IGHV_J == VJ) %>% select(group, n_cell, rest_cell) %>% column_to_rownames('group') %>% t() %>% as.table() %>% pairwise_prop_test(.) %>% mutate(IGHV_J = VJ)
+
+}
+
+st.vj.p = map_df(unique(st.vj$IGHV_J), my.chiseq.VJ) %>% add_significance( 'p') %>% 
+  filter(! (group1 == 'AZ' & group2 == 'Cso-hb') , ! (group1 == 'AZ-hb' & group2 == 'Cso') ) %>% 
+  filter(group1 != 'n_cell', group2 != 'n_cell') %>% 
+    left_join(df.vj %>% transmute(IGHV_J , group1 = HTO_classification, value1 = n ) ) %>% 
+    left_join(df.vj %>% transmute(IGHV_J , group2 = HTO_classification, value2 = n ) ) 
+
+addWorksheet(wb.p, sheetName = 'IGHV-J_pct')
+writeDataTable(wb.p,  8, as.data.frame(st.vj.p) )
+
+# write.xlsx(as.data.frame(st.vj.p), 'pvalue.cellcomposition.xlsx', sheetName = 'IGHV-J_pct', append = T, row.names = F, col.names = T , showNA = F)
+
+
+st.vj.p.shap = st.vj.p %>% mutate(Comparsion = str_c(group1, ' vs ' , group2)) %>% 
+  select( Comparsion, p.signif, IGHV_J) %>% distinct() %>%  spread(Comparsion, p.signif)
+
+addWorksheet(wb.psig, sheetName = 'IGHV-J_p')
+writeDataTable(wb.psig, 8, as.data.frame(st.v.p.shap) )
+
+# write.xlsx(as.data.frame(st.vj.p.shap ), 'pvalue.groupComparsion.xlsx', sheetName = 'IGHV-J_p', append = T, row.names = F, col.names = T , showNA = F)
+# 
+# write.xlsx(as.data.frame(st.vj.p.shap ), 'psignif.groupComparsion.xlsx', sheetName = 'IGHV-J_p', append = T, row.names = F, col.names = T , showNA = F)
+
+```
+
+
+
+## IGHV-IGHKV/IGHLV
+```{r IGHV-IGHKV/IGHLV}
+group.vh_vl = expand.grid(VH = unique(str_extract(q.b@meta.data$CTgene, 'IGHV\\d-\\d+\\w?')) , 
+                          VL = unique(str_extract(q.b@meta.data$CTgene, 'IG[KL]V\\d-\\d+\\w?')),
+                          HTO_classification = order_sample) %>% 
+  filter(!is.na(VH))
+
+df.vh_vl = q.b@meta.data %>% 
+  # filter(b.cell.types == 'Bmemory') %>% 
+  dplyr::select(HTO_classification, CTgene) %>% 
+  mutate(VH = str_extract(CTgene, 'IGHV\\d-\\d+\\w?'),
+         VL = str_extract(CTgene, 'IG[KL]V\\d-\\d+\\w?')) %>% 
+  filter(!is.na(VH), !is.na(VL)) %>% 
+  group_by(VH, VL, HTO_classification) %>% 
+  summarise(n = n()) %>% 
+  ungroup() %>% group_by(HTO_classification) %>% 
+  mutate(total = sum(n),
+         pct = n/ total *100) %>% 
+  ungroup() %>% 
+  dplyr::select(VH,VL,n,total, HTO_classification) %>% 
+  right_join(group.vh_vl) %>%  # supply all IGHV IGHJ group combinations
+  mutate(VH_VL = str_c( VH, VL, sep = ':')) %>% 
+  dplyr::select(-VH, -VL) %>% 
+  ungroup()
+
+write_tsv(df.vh_vl %>% select(-total) %>%  distinct() %>% spread(HTO_classification, n), 'q.b.rmDobulets//IGHV-IGKLV.allB.freq.tsv', na = '') 
+
+# filter out IGHV_J with all groups are  0 
+VH_VL_0 = df.vh_vl %>% group_by(VH_VL) %>% dplyr::summarise(n = sum(n, na.rm = T)) %>% ungroup() %>% filter(n == 0) %>% pull(VH_VL)
+
+# Isotype
+st.vh_vl =df.vh_vl %>% ungroup() %>% filter(!VH_VL %in% VH_VL_0) %>% 
+  transmute(VH_VL, group = HTO_classification, 
+            n_cell = n, total_cell = total) %>% 
+  tidyr::complete(VH_VL, group, fill = list(n_cell = 0, total_cell = 0 )) %>% 
+  mutate(rest_cell = total_cell - n_cell )   %>% 
+  filter( total_cell != 0 )
+
+# filter out IGHVJ only in one group
+VH_VL_1 = st.vh_vl %>% group_by(VH_VL) %>% dplyr::summarise(n = n()) %>% ungroup() %>% filter(n >1) %>% pull(VH_VL)
+st.vh_vl  = st.vh_vl %>% filter(VH_VL %in% VH_VL_1)
+
+
+
+my.chiseq.VH_VL <- function(Vs){
+  # mydf = st.b
+  # celltype = 'Bnaive'
+  
+ st.vh_vl %>% filter(VH_VL == Vs) %>% select(group, n_cell, rest_cell) %>% column_to_rownames('group') %>% t() %>% as.table() %>% pairwise_prop_test(.) %>% mutate(VH_VL = Vs)
+
+}
+
+st.vh_vl.p.r = map_df(unique(st.vh_vl$VH_VL), my.chiseq.VH_VL) %>% add_significance( 'p') %>% 
+  filter(! (group1 == 'AZ' & group2 == 'Cso-hb') , ! (group1 == 'AZ-hb' & group2 == 'Cso') ) %>% 
+  filter(group1 != 'n_cell', group2 != 'n_cell') %>% 
+    left_join(df.vh_vl %>% transmute(VH_VL , group1 = HTO_classification, value1 = n ) ) %>% 
+    left_join(df.vh_vl %>% transmute(VH_VL , group2 = HTO_classification, value2 = n ) ) 
+
+
+write.xlsx(as.data.frame(st.vh_vl.p), 'pvalue.cellcomposition.xlsx', sheetName = 'IGHV_IGKLV_pct', append = T, row.names = F, col.names = T , showNA = F)
+
+
+st.vh_vl.p= st.vh_vl.p.r %>% mutate(Comparsion = str_c(group1, ' vs ' , group2)) %>% 
+  select( Comparsion, p, VH_VL) %>% distinct() %>%  spread(Comparsion, p)
+
+addWorksheet(wb.p, sheetName = 'IGHV_IGKLV_p')
+writeDataTable(wb.p,  9, as.data.frame(st.vh_vl.p) )
+
+# write.xlsx(as.data.frame(st.vh_vl.p ), 'pvalue.groupComparsion.xlsx', sheetName = 'IGHV_IGKLV_p', append = T, row.names = F, col.names = T , showNA = F)
+
+
+st.vh_vl.p.shap = st.vh_vl.p.r %>% mutate(Comparsion = str_c(group1, ' vs ' , group2)) %>% 
+  select( Comparsion, p.signif, VH_VL) %>% distinct() %>%  spread(Comparsion, p.signif)
+
+addWorksheet(wb.psig, sheetName = 'IGHV_IGKLV_p')
+writeDataTable(wb.psig, 9, as.data.frame(st.vh_vl.p.shap) )
+
+
+# write.xlsx(as.data.frame(st.vh_vl.p.shap ), 'psignif.groupComparsion.xlsx', sheetName = 'IGHV_IGKLV_p', append = T, row.names = F, col.names = T , showNA = F)
+
+# write_tsv(as.data.frame(st.vh_vl.p.shap), 'psignif.groupComparsion.IGHV_IGKLV.xls', na = '')
+# write_tsv(as.data.frame(st.vh_vl.p), 'pvalue.groupComparsion.IGHV_IGKLV.xls', na = '')
+
+```
+
+
+```{r save}
+saveWorkbook(wb.psig, file = "psignif.cellcomposition.xlsx", overwrite = TRUE)
+saveWorkbook(wb.p, file = "pvalue.cellcomposition.xlsx", overwrite = TRUE)
+
+```
